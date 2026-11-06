@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Observa · Alvo de calibração</title><link rel="stylesheet" href="/static/target.css"><script src="/static/target.js" defer></script></head>
+<body>
+  <section id="target-login" hidden><form id="target-login-form"><h1>Conectar tela de calibração</h1><label>Código do servidor<input id="target-key" type="password" required autocomplete="current-password"></label><button>Conectar</button><p id="target-login-error" role="alert"></p></form></section>
+  <section id="target-setup">
+    <span class="eyebrow">OBSERVA · CALIBRAÇÃO GUIADA</span><h1 id="setup-title">Preparar tela</h1>
+    <p id="setup-description"></p><p>Coloque esta janela no monitor indicado e mantenha-a visível. Se notebook e TV estiverem no mesmo computador, use a área de trabalho estendida.</p>
+    <label>Modo<select id="display-mode"><option value="gaze" selected>Mostrar onde estou olhando</option><option value="calibration">Pontos da calibração geral (antiga)</option></select></label>
+    <div id="position-options"><label>Participante<input id="position-participant" placeholder="P001" maxlength="80" list="known-participants" autocomplete="off"></label><datalist id="known-participants"></datalist><label>O que calibrar<select id="position-surface"><option value="notebook">Tela do notebook do participante · 9 pontos + 4</option><option value="tv">Tela da apresentação (TV) · 9 pontos + 4</option><option value="robot">Robô NAO · 6 partes + 6</option></select></label><p id="position-hint" class="hint" role="status"></p><label>Câmera para estimar a posição<select id="position-role"><option value="notebook">Câmera do notebook</option><option value="nao">Câmera do NAO</option><option value="validation">Câmera da apresentação (TV)</option></select></label><p id="position-reading" role="status">Verificando leitura dos olhos…</p><button id="calibrate-position">Calibrar e validar</button><p id="position-info">Ao fim da calibração, a validação começa sozinha.</p><div id="position-library" class="library"></div></div>
+    <label id="voice-option"><input id="voice-enabled" type="checkbox" checked> Falar as instruções neste notebook</label>
+    <button id="enable-display">Exibir alvo em tela cheia</button><p id="setup-error" role="status"></p>
+    <small>Calibre uma câmera de cada vez: escolha a câmera, calibre e espere a validação terminar. Mantenha a cabeça parada e mova só os olhos. No robô, olhe para a parte física indicada, não para o desenho. Cada câmera fica salva para este participante e aparece em “Olhar ao vivo”. Esc sai da tela cheia.</small>
+  </section>
+  <main id="target-stage" hidden>
+    <header><span id="display-label"></span><span id="phase-label">Aguardando operador</span></header>
+    <div id="fixation-point" class="fixation-point" data-position="center" hidden><span></span></div>
+    <div id="gaze-reticle" class="gaze-reticle" aria-label="Posição estimada do olhar" hidden><span></span></div>
+    <section id="physical-instruction" hidden><span class="eyebrow">OLHE PARA O ALVO FÍSICO</span><h1 id="instruction-title"></h1><p id="instruction-description"></p>
+      <svg id="robot-guide" data-part="head" viewBox="0 0 320 380" role="img" aria-label="Guia das partes do robô, visto de frente" hidden>
+        <g class="robot-limbs"><path id="robot-arm-right" class="robot-part" d="M105 150L73 166L56 238L82 245L111 188Z"/><path id="robot-arm-left" class="robot-part" d="M215 150L247 166L264 238L238 245L209 188Z"/></g>
+        <g id="robot-head" class="robot-part"><rect x="99" y="42" width="122" height="88" rx="32"/><path d="M135 42H185V58H135Z" class="blue"/><circle cx="131" cy="85" r="9" class="eye"/><circle cx="189" cy="85" r="9" class="eye"/></g>
+        <path id="robot-torso" class="robot-part" d="M116 145Q160 128 204 145L213 228Q160 250 107 228Z"/>
+        <circle cx="160" cy="175" r="24" class="blue"/>
+        <g id="robot-leg-right" class="robot-part"><path d="M111 244H151L147 318H108Z"/><path d="M106 319H149L151 344H86Q84 329 106 319Z"/></g>
+        <g id="robot-leg-left" class="robot-part"><path d="M169 244H209L212 318H173Z"/><path d="M171 319H214Q236 329 234 344H169Z"/></g>
+        <circle id="robot-gaze-dot" r="13" hidden/><text x="64" y="373">Sua esquerda</text><text x="203" y="373">Sua direita</text>
+      </svg>
+    </section>
+    <section id="standby"><h1 id="standby-title">Pronto</h1><p id="standby-description">Aguarde o operador iniciar.</p></section>
+    <footer><span id="target-status">Mantenha esta janela visível.</span><div><button id="verify-position">Próximo ponto de teste</button><button id="free-position">Olhar livre</button><button id="measure-position">Validar de novo</button><button id="retry-position">Recalibrar</button><button id="target-settings">Preparar tela</button></div></footer>
+  </main>
+  <aside id="webcam-preview"><canvas id="webcam-canvas" width="320" height="240" aria-label="Webcam com marcação dos olhos acompanhados"></canvas><span id="webcam-status">Conectando webcam…</span></aside>
+</body></html>

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Observa · Laboratório de atenção visual</title>
+  <link rel="stylesheet" href="/static/styles.css"><script src="/static/ray-overlay.js" defer></script><script src="/static/app.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login-wrap">
+    <form id="login-form" class="login-card">
+      <span class="eyebrow">LABORATÓRIO · REDE LOCAL</span><h1>Observa<span>●</span></h1>
+      <p>Três perspectivas.<br>Uma sessão de observação.</p>
+      <label>Código de acesso do servidor<input id="access-key" type="password" required autocomplete="current-password"></label>
+      <button type="submit">Entrar no laboratório →</button><small>O código aparece no terminal do servidor e fica salvo em .local/access-key.txt.</small>
+      <p id="login-error" role="alert"></p>
+    </form>
+  </section>
+  <div id="workspace" hidden>
+    <aside class="sidebar">
+      <div class="brand">Observa<span>●</span><small>ATENÇÃO VISUAL</small></div>
+      <nav aria-label="Navegação principal">
+        <button class="nav active" data-tab="capture"><b>01</b> Câmeras e sessão</button>
+        <button class="nav" data-tab="live"><b>02</b> Olhar ao vivo</button>
+        <button class="nav" data-tab="review"><b>03</b> Validação humana</button>
+        <button class="nav" data-tab="connect"><b>04</b> Conectar dispositivos</button>
+      </nav>
+      <div class="side-note"><span class="dot"></span> Processamento no servidor<p>Estimativa do alvo visual.<br>Não mede compreensão ou atenção cognitiva.</p></div>
+      <button id="logout" class="ghost">Sair do painel</button>
+    </aside>
+    <main>
+      <header><div><span class="eyebrow">MONITORAMENTO MULTICÂMERA</span><h1 id="page-title">Câmeras e sessão</h1></div><span id="server-status" class="badge">Conectando…</span></header>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section id="tab-capture" class="tab">
+        <div class="panel participant-panel"><label>Identificador do participante<input id="participant" placeholder="Ex.: P001 · informe antes de calibrar" maxlength="80" autocomplete="off"></label><p class="small muted">A calibração pertence a este participante. Refaça o ajuste quando trocar de pessoa ou alterar a disposição do ambiente.</p></div>
+        <div class="attention-panel" id="attention-panel"><div><strong id="attention-title">Preparar referência do olhar</strong><p id="attention-message">O sistema precisa aprender onde ficam os alvos nesta disposição.</p></div><button id="start-scene">Calibrar nesta disposição</button></div>
+        <div id="camera-slot-capture"></div>
+        <div class="two-columns">
+          <article class="panel calibration-panel">
+            <div class="panel-top"><span class="step-number">A</span><div><h2>Calibrar os alvos físicos</h2><p>Uma pessoa no enquadramento. Cabeça do NAO fixa.</p></div></div>
+            <p>Na calibração pelo painel, olhe para o alvo físico indicado e clique em <strong>Participante pronto · coletar</strong>. Não é preciso abrir telas de ponto. As câmeras coletam juntas durante 3 segundos.</p>
+            <button id="begin-quick" class="quick-button">Calibrar pelo painel · sem janelas extras</button>
+            <p class="small muted">Notebook e TV em duas posições, cabeça e duas pernas do NAO, e dois locais fora dos alvos. A verificação começa automaticamente após o ajuste. Prepare o olhar antes de cada clique.</p>
+            <details><summary>Opcional: automática com pontos nas duas telas</summary><p class="small muted">Use este modo quando notebook e TV estiverem configurados em monitores separados. Abra uma janela em cada tela e ative a exibição do alvo.</p><div class="target-links"><a class="button secondary" href="/alvo?display=notebook&amp;mode=calibration" target="_blank" rel="noopener">Abrir ponto no notebook ↗</a><a class="button secondary" href="/alvo?display=tv&amp;mode=calibration" target="_blank" rel="noopener">Abrir ponto na TV ↗</a></div><p id="display-readiness" class="small muted"></p><button id="begin-auto" class="secondary">Iniciar automática com pontos</button></details>
+            <div class="button-row"><button id="pause-calibration" class="secondary" disabled>Pausar</button><button id="next-participant" class="secondary">Próximo participante</button></div>
+            <details><summary>Ajuste manual / calibração detalhada</summary><label>Perfil<select id="calibration-profile"><option value="standard">Detalhado · 4 segundos por etapa</option><option value="quick">Rápido · 3 segundos por etapa</option></select></label><div class="button-row"><button id="begin-fit" class="secondary">1. Ajustar alvos</button><button id="begin-check" class="secondary">2. Verificação independente</button></div></details>
+            <div id="calibration-box" class="calibration-box"><span class="eyebrow">AGUARDANDO CONFIGURAÇÃO</span><h3>Notebook · TV · NAO · Outro local</h3><p>A calibração usa as câmeras do notebook, do NAO e da apresentação ao mesmo tempo.</p></div>
+            <progress id="cal-progress" max="4" value="0" aria-label="Progresso da coleta"></progress>
+            <button id="capture-step" disabled>Participante pronto · coletar etapa</button>
+            <details><summary>Refazer uma etapa</summary><label>Etapa<select id="retry-step"></select></label><div class="button-row"><button id="retry-capture" class="secondary">Coletar novamente</button><button id="finish-calibration" class="secondary">Recalcular resultado</button></div></details>
+            <div id="calibration-counts" class="small muted"></div><div id="check-summary" class="small"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-top"><span class="step-number">B</span><div><h2>Gravar o experimento</h2><p>Imagens, classificações e eventos na mesma sessão.</p></div></div>
+            <div class="live-result"><span class="eyebrow">ALVO VISUAL ESTIMADO</span><strong id="live-target">Indeterminado</strong><span id="live-task"></span><span id="live-reason">Calibre os alvos para iniciar.</span></div>
+            <p id="calibration-owner" class="small muted">Participante ainda não calibrado.</p>
+            <details><summary>Uso em piloto com verificação abaixo de 65%</summary><label>Justificativa registrada na sessão<textarea id="override" placeholder="Descreva por que a sessão será usada apesar do desempenho baixo."></textarea></label></details>
+            <div class="button-row"><button id="start-recording">Iniciar gravação</button><button id="stop-recording" class="danger" disabled>Encerrar</button><span id="recording-time" class="timer">00:00</span></div>
+            <hr><h3>Marcos da apresentação</h3><div class="button-row event-buttons"><button data-event="INICIO_CENA" class="secondary">Cena</button><button data-event="FALA_NAO" class="secondary">Fala do NAO</button><button data-event="DECISAO_NOTEBOOK" class="secondary">Decisão</button><button data-event="SINCRONIA" class="secondary">Sincronia</button></div>
+            <label>Nota para o próximo marco<input id="event-note" maxlength="500" placeholder="Ex.: cena 03 / gesto de referência"></label>
+            <small>Para validar o alinhamento, faça um gesto visível nas três câmeras e registre um marco no início e no fim. Os tempos de captura são aproximados, sem sincronização de hardware.</small>
+          </article>
+        </div>
+      </section>
+      <section id="tab-live" class="tab" hidden>
+        <div class="live-banner panel"><div><span class="eyebrow">AGORA A PESSOA ESTÁ OLHANDO PARA</span><strong id="lg-target">Indeterminado</strong><span id="lg-reason" class="small muted">Aguardando leitura.</span></div><div class="live-banner-side"><label class="small">Participante<select id="lg-participant-select"><option value="">Último calibrado</option></select></label><span id="lg-recording" class="badge">Sem gravação</span><span id="lg-participant" class="small muted"></span></div></div>
+        <div id="camera-block" class="camera-block">
+          <div class="section-heading"><div><h2>As perspectivas do experimento</h2><p>Escolha a origem de cada imagem e aplique a configuração. As três câmeras analisam os olhos.</p></div><button id="save-cameras">Aplicar câmeras</button></div>
+          <div class="ray-controls"><label class="ray-toggle"><input id="show-eye-rays" type="checkbox" checked> Mostrar linhas dos olhos</label><label>Verde quando olhar para<select id="ray-reference"><option value="screens">Telas · notebook ou TV</option><option value="robot">Robô NAO</option><option value="task" selected>Tarefa · notebook, TV ou NAO</option></select></label><p class="small muted">Linhas 2D aproximadas. A cor usa a calibração e a fusão das câmeras. Cinza = leitura inconclusiva.</p><p class="small">Posição estimada do olhar: <a href="/alvo?display=notebook" target="_blank" rel="noopener">Abrir alvo no notebook</a> · <a href="/alvo?display=tv" target="_blank" rel="noopener">Abrir alvo na TV</a></p></div>
+          <div class="camera-grid">
+            <article class="camera-card"><div class="camera-title"><span>01 / NOTEBOOK</span><span id="status-notebook" class="badge">Sem sinal</span></div><div class="preview"><img id="preview-notebook" alt="Prévia da câmera do notebook" hidden><span class="placeholder">Aguardando câmera do notebook</span><canvas id="ray-notebook" class="ray-canvas" aria-hidden="true"></canvas><span id="ray-status-notebook" class="ray-status unknown">Aguardando leitura dos olhos</span></div><label class="sr-only" for="source-notebook">Câmera do notebook</label><select id="source-notebook"></select><p id="detail-notebook">Olhos e orientação da cabeça</p></article>
+            <article class="camera-card"><div class="camera-title"><span>02 / ROBÔ NAO</span><span id="status-nao" class="badge">Sem sinal</span></div><div class="preview"><img id="preview-nao" alt="Prévia da câmera interna do NAO" hidden><span class="placeholder">Aguardando câmera do robô</span><canvas id="ray-nao" class="ray-canvas" aria-hidden="true"></canvas><span id="ray-status-nao" class="ray-status unknown">Aguardando leitura dos olhos</span></div><label class="sr-only" for="source-nao">Câmera do NAO</label><select id="source-nao"></select><p id="detail-nao">Segunda perspectiva do participante</p></article>
+            <article class="camera-card"><div class="camera-title"><span>03 / APRESENTAÇÃO (TV)</span><span id="status-validation" class="badge">Sem sinal</span></div><div class="preview"><img id="preview-validation" alt="Prévia da câmera da tela de apresentação" hidden><span class="placeholder">Aguardando câmera da apresentação</span><canvas id="ray-validation" class="ray-canvas" aria-hidden="true"></canvas><span id="ray-status-validation" class="ray-status unknown">Aguardando leitura dos olhos</span></div><label class="sr-only" for="source-validation">Câmera da tela de apresentação</label><select id="source-validation"></select><p id="detail-validation">Terceira perspectiva, na tela de apresentação</p></article>
+          </div>
+        </div>
+        <div id="camera-slot-live"></div>
+        <div class="gaze-grid">
+          <article class="panel gaze-card" id="lg-card-tv"><div class="gaze-card-top"><h2>Apresentação / TV</h2><span id="lg-badge-tv" class="badge">—</span></div><div class="screen-frame"><canvas id="lg-canvas-tv" aria-label="Posição estimada do olhar na apresentação"></canvas></div><p id="lg-status-tv" class="small muted">—</p></article>
+          <article class="panel gaze-card" id="lg-card-notebook"><div class="gaze-card-top"><h2>Notebook do participante</h2><span id="lg-badge-notebook" class="badge">—</span></div><div class="screen-frame"><canvas id="lg-canvas-notebook" aria-label="Posição estimada do olhar no notebook"></canvas></div><p id="lg-status-notebook" class="small muted">—</p></article>
+          <article class="panel gaze-card" id="lg-card-robot"><div class="gaze-card-top"><h2>Robô NAO</h2><span id="lg-badge-robot" class="badge">—</span></div><div class="robot-frame">
+            <svg class="live-robot" viewBox="0 0 320 380" role="img" aria-label="Robô NAO visto de frente; a parte olhada fica destacada">
+              <g class="robot-limbs"><path id="lr-arm-right" class="robot-part" d="M105 150L73 166L56 238L82 245L111 188Z"/><path id="lr-arm-left" class="robot-part" d="M215 150L247 166L264 238L238 245L209 188Z"/></g>
+              <g id="lr-head" class="robot-part"><rect x="99" y="42" width="122" height="88" rx="32"/><path d="M135 42H185V58H135Z" class="blue"/><circle cx="131" cy="85" r="9" class="eye"/><circle cx="189" cy="85" r="9" class="eye"/></g>
+              <path id="lr-body" class="robot-part" d="M116 145Q160 128 204 145L213 228Q160 250 107 228Z"/>
+              <circle cx="160" cy="175" r="24" class="blue"/>
+              <g id="lr-leg-right" class="robot-part"><path d="M111 244H151L147 318H108Z"/><path d="M106 319H149L151 344H86Q84 329 106 319Z"/></g>
+              <g id="lr-leg-left" class="robot-part"><path d="M169 244H209L212 318H173Z"/><path d="M171 319H214Q236 329 234 344H169Z"/></g>
+              <g id="lr-dots"></g>
+              <text x="40" y="373">Esquerda do participante</text><text x="196" y="373">Direita</text>
+            </svg>
+          </div><p id="lg-status-robot" class="small muted">—</p></article>
+        </div>
+        <div class="panel live-legend"><p class="small"><strong>Como ler:</strong> cada câmera calibrada tem a sua cor: <span class="cam-dot" style="background:rgb(99,221,255)"></span> notebook · <span class="cam-dot" style="background:rgb(199,155,255)"></span> NAO · <span class="cam-dot" style="background:rgb(255,207,104)"></span> apresentação. O círculo é a posição estimada e o rastro mostra os últimos 2 segundos. No robô, a parte destacada é a que as câmeras indicam. A borda verde marca o alvo escolhido pelas câmeras: cada câmera vota na tela ou no robô onde a estimativa dela cai.</p><p class="small muted">Os mapas vêm da página de alvo (<a href="/alvo?display=notebook" target="_blank" rel="noopener">notebook</a> · <a href="/alvo?display=tv" target="_blank" rel="noopener">TV</a>), um por câmera, e ficam salvos por participante. É uma estimativa por webcam (normalmente 150 a 450 px de erro numa tela de notebook). Não confirma atenção nem compreensão. Esta aba não precisa da página de alvo aberta durante a apresentação.</p></div>
+      </section>
+      <section id="tab-review" class="tab" hidden>
+        <div class="section-heading"><div><h2>Revisão independente</h2><p>Anote os intervalos antes de consultar o resultado automático.</p></div><button id="refresh-sessions" class="secondary">Atualizar sessões</button></div>
+        <div class="panel"><label>Sessão gravada<select id="session-list"><option value="">Selecione uma sessão</option></select></label><p id="session-info" class="small muted">As gravações finalizadas aparecem aqui.</p></div>
+        <div id="review-content" hidden>
+          <div class="two-columns review-columns">
+            <article class="panel"><div class="section-heading"><h2>Imagens gravadas</h2><label>Perspectiva<select id="review-role"><option value="validation">Apresentação / TV</option><option value="notebook">Notebook</option><option value="nao">NAO</option></select></label></div><div class="review-image"><img id="review-frame" alt="Quadro gravado para anotação" hidden><span id="frame-missing">Selecione um instante.</span></div><div class="button-row"><button id="play" class="secondary">Reproduzir</button><button id="back-frame" class="secondary">−0,2 s</button><button id="next-frame" class="secondary">+0,2 s</button><span id="review-clock" class="timer">0.00 s</span></div><label class="sr-only" for="timeline">Tempo da sessão</label><input id="timeline" type="range" min="0" max="1" step="0.05" value="0"><p id="frame-time" class="small muted"></p><details><summary>Marcos registrados</summary><div id="session-events" class="small"></div></details></article>
+            <article class="panel"><h2>Anotar o alvo visual</h2><p class="small muted">Use Indeterminado quando o vídeo não permitir decidir. Intervalos do mesmo avaliador não podem se sobrepor.</p><div class="button-row"><label class="grow">Avaliador<input id="annotator" value="A01" maxlength="80"></label><button id="load-annotations" class="secondary">Carregar anotações</button></div><div class="interval-inputs"><label>Início (s)<input id="interval-start" type="number" min="0" step="0.05" value="0"></label><label>Fim (s)<input id="interval-end" type="number" min="0" step="0.05" value="1"></label></div><div class="button-row"><button id="mark-start" class="secondary">Usar tempo no início</button><button id="mark-end" class="secondary">Usar tempo no fim</button></div><label>Alvo observado<select id="interval-target"><option>NOTEBOOK</option><option>TV</option><option>NAO</option><option>OUTRO_LOCAL</option><option>INDETERMINADO</option></select></label><button id="add-interval">Adicionar intervalo</button><div id="annotation-list" class="annotation-list"></div><div class="button-row"><button id="save-annotations" class="secondary">Salvar anotações</button><button id="evaluate">Calcular validação</button></div><p id="annotation-status" class="small muted"></p></article>
+          </div>
+          <article id="validation-report" class="panel" hidden></article>
+          <div class="button-row"><a id="csv-download" class="button secondary" href="#">Exportar previsões CSV</a><button id="report-download" class="secondary" disabled>Exportar relatório JSON</button></div>
+        </div>
+      </section>
+      <section id="tab-connect" class="tab" hidden>
+        <div class="two-columns"><article class="panel"><span class="eyebrow">COMPUTADORES NA MESMA REDE</span><h2>Conectar o notebook e a câmera da apresentação</h2><ol><li>Baixe o cliente e extraia a pasta no computador que tem a webcam.</li><li>Execute <code>iniciar_cliente.bat</code>. É necessário Python 3.</li><li>Informe o endereço LAN deste servidor e o código de acesso.</li><li>Volte a “Câmeras e sessão”, escolha as câmeras e aplique.</li></ol><a class="button" href="/api/client.zip">Baixar conectores ZIP ↓</a><p>As webcams aparecem como “nome do computador / Webcam 0, 1…”. Confira cada imagem após selecionar. Uma câmera conectada ao servidor também usa esse cliente.</p><p class="small muted">A câmera de outro notebook não aparece como webcam local do servidor. O conector envia apenas as câmeras selecionadas no painel, sem áudio.</p></article><article class="panel"><span class="eyebrow">CÂMERA INTERNA DO ROBÔ</span><h2>Conectar o NAO</h2><p>Copie <code>nao_client.py</code> para o robô e execute em um terminal com NAOqi disponível:</p><pre id="nao-command"></pre><p>Informe o mesmo código e selecione <strong>NAO / câmera superior</strong> no painel. O robô envia JPEG e a pose da cabeça; o servidor faz a análise.</p><p>Se usar o SDK em outro computador, acrescente <code>--robot IP_DO_NAO</code>. O conector é compatível com Python 2.7 do NAOqi clássico. Confirme a versão instalada no seu robô.</p><p class="small muted">Mantenha a cabeça do NAO na pose calibrada. Uma mudança superior ao limite configurado faz a leitura daquela câmera ficar indeterminada.</p></article></div>
+        <article class="panel"><h2>Acesso à rede local</h2><p>Abra no notebook o endereço IP do servidor com a porta 8765. O endereço <code>localhost</code> só funciona neste computador.</p><div class="button-row"><button id="show-connection" class="secondary">Mostrar código de conexão</button><code id="connection-details" hidden></code></div><p class="small muted">Use uma rede local controlada. Nesta configuração HTTP, imagens e código trafegam sem cifragem. O navegador controla o painel; a captura é feita pelos conectores, sem exigir acesso à webcam via página HTTP.</p><h3>Clientes registrados</h3><div id="node-list" class="node-list">Nenhum cliente conectado.</div></article>
+      </section>
+      <footer>OBSERVA / PROTOCOLO MULTICÂMERA <span>Calibração empírica · valide o desempenho no seu ambiente</span></footer>
+    </main>
+  </div>
+</body>
+</html>

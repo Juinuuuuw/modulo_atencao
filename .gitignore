@@ -1,0 +1,7 @@
+.venv/
+.venv-client/
+__pycache__/
+*.pyc
+.local/
+monitoring_logs/
+sessions/
