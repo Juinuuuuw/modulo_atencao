@@ -458,8 +458,9 @@ function resizeLiveCanvases() {
 window.addEventListener("resize", () => { if (activeTab === "live") resizeLiveCanvases(); });
 function median(values) { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.floor(sorted.length / 2)]; }
 function smoothed(key) {
-  // Mediana das 5 últimas leituras: reduz o tremor sem atrasar muito o ponto.
-  const recent = (liveTrails[key] || []).slice(-5);
+  // O servidor já filtra as leituras no tempo; a mediana das 3 últimas só tira o resto
+  // do tremor sem somar muito atraso.
+  const recent = (liveTrails[key] || []).slice(-3);
   return recent.length ? {x: median(recent.map(p => p.x)), y: median(recent.map(p => p.y))} : null;
 }
 function drawScreen(display, screen, highlighted) {
@@ -490,6 +491,11 @@ function drawScreen(display, screen, highlighted) {
     const point = estimate.gaze?.visible ? smoothed(key) : null;
     if (!point) continue;
     const x = clamp(point.x) * w, y = clamp(point.y) * h;
+    if (estimate.gaze.inside === false) {
+      // A zona diz que o olhar está em outra superfície: só uma marca apagada, sem anel.
+      ctx.fillStyle = `rgba(${color},.35)`; ctx.beginPath(); ctx.arc(x, y, 4 * ratio, 0, Math.PI * 2); ctx.fill();
+      continue;
+    }
     ctx.strokeStyle = `rgb(${color})`; ctx.lineWidth = 2.5 * ratio;
     ctx.beginPath(); ctx.arc(x, y, 14 * ratio, 0, Math.PI * 2); ctx.stroke();
     ctx.fillStyle = `rgb(${color})`; ctx.beginPath(); ctx.arc(x, y, 4 * ratio, 0, Math.PI * 2); ctx.fill();
@@ -505,10 +511,13 @@ function estimateLine(estimate) {
   const quality = level ? levelNames[level] : "sem validação";
   const surfaceLabel = {notebook: "o notebook", tv: "a apresentação", robot: "o robô"};
   const closer = gaze.closer_to ? ` (mais compatível com ${surfaceLabel[gaze.closer_to]})` : "";
+  // Duas superfícies na mesma direção para esta câmera (ex.: robô na frente da TV): ela não
+  // separa as duas sozinha; a decisão de cima usa as outras câmeras.
+  const also = gaze.ambiguous_with ? ` · também compatível com ${surfaceLabel[gaze.ambiguous_with]}` : "";
   const where = !gaze.visible ? esc(gaze.reason)
-    : gaze.surface === "robot" ? (!gaze.inside ? `fora do robô${closer}` : gaze.part ? `olhando: ${esc(partShort[gaze.part])}`
-      : gaze.part_reliable === false ? `olhando o robô · parte não confiável (${Math.round(6 * gaze.part_accuracy)}/6 na validação)` : "olhando o robô")
-    : gaze.inside ? `x ${(gaze.x * 100).toFixed(0)}% · y ${(gaze.y * 100).toFixed(0)}%` : `fora desta tela${closer}`;
+    : gaze.surface === "robot" ? (!gaze.inside ? `fora do robô${closer}` : (gaze.part ? `olhando: ${esc(partShort[gaze.part])}`
+      : gaze.part_reliable === false ? `olhando o robô · parte não confiável (${Math.round(6 * gaze.part_accuracy)}/6 na validação)` : "olhando o robô") + also)
+    : gaze.inside ? `x ${(gaze.x * 100).toFixed(0)}% · y ${(gaze.y * 100).toFixed(0)}%${also}` : `fora desta tela${closer}`;
   return `<span class="cam-line"><span class="cam-dot" style="background:rgb(${cameraColors[estimate.role]})"></span>${esc(cameraNames[estimate.role])}: ${where} <span class="muted">· ${esc(quality)}</span></span>`;
 }
 function renderRobot(robot) {
@@ -529,10 +538,12 @@ function renderRobot(robot) {
 }
 function renderLive() {
   const data = liveData; if (!data) return;
-  const fused = data.target;
-  $("lg-target").textContent = fused === "NAO" && data.robot.part ? `Robô NAO · ${partShort[data.robot.part]}` : (names[fused] || fused);
+  // "stable" tem histerese: um alvo novo precisa durar 0,35 s para aparecer.
+  const fused = liveTarget(data), part = data.stable ? data.stable.part : data.robot.part;
+  const pending = data.stable?.pending ? ` · confirmando: ${names[data.stable.pending] || data.stable.pending}` : "";
+  $("lg-target").textContent = fused === "NAO" && part ? `Robô NAO · ${partShort[part]}` : (names[fused] || fused);
   $("lg-target").className = fused === "INDETERMINADO" ? "unknown" : "";
-  $("lg-reason").textContent = data.source === "posição" ? `${data.reason} · pelas calibrações de posição de ${data.participant}`
+  $("lg-reason").textContent = data.source === "posição" ? `${data.reason}${pending} · pelas calibrações de posição de ${data.participant}`
     : data.source === "classificador" ? `${data.reason} · pelo classificador de alvos (sem calibração de posição)`
     : "Nenhuma calibração para este participante. Calibre cada câmera na página de alvo (/alvo).";
   $("lg-recording").textContent = data.recording ? "● Gravando" : "Sem gravação";
@@ -557,8 +568,9 @@ function renderLive() {
       : screen.estimates.map(estimateLine).join("");
     drawScreen(display, screen, highlighted);
   }
-  renderRobot(data.robot);
+  renderRobot({...data.robot, looking: fused === "NAO", part});
 }
+function liveTarget(data) { return data.stable?.target ?? data.target; }
 async function pollLive() {
   if (!authenticated || activeTab !== "live" || document.hidden || liveBusy) return;
   liveBusy = true;
@@ -580,7 +592,7 @@ async function pollLive() {
 }
 setInterval(() => { void pollLive(); }, 100);
 // Redesenha para o rastro esmaecer mesmo quando a leitura some.
-setInterval(() => { if (activeTab === "live" && liveData) for (const d of ["notebook", "tv"]) drawScreen(d, liveData.screens[d], liveData.target === (d === "tv" ? "TV" : "NOTEBOOK")); }, 250);
+setInterval(() => { if (activeTab === "live" && liveData) for (const d of ["notebook", "tv"]) drawScreen(d, liveData.screens[d], liveTarget(liveData) === (d === "tv" ? "TV" : "NOTEBOOK")); }, 250);
 let polling=false;
 setInterval(async()=>{if(!authenticated||polling)return;polling=true;try{await poll();}catch(error){$("server-status").textContent="Servidor indisponível";$("server-status").className="badge";}finally{polling=false;}},800);
 setInterval(()=>{void refreshPreviews();},50);

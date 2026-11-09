@@ -18,7 +18,8 @@ from .attention_timeline import AttentionConfig, AttentionTimeline
 from .target_classifier import TARGETS, UNKNOWN, ROLES, REGIONS, TargetClassifier, feature_status, screen_feature_status, fuse, region_votes
 from .validation import evaluate_checks
 from .calibration_protocol import PROFILES, calibration_plan
-from .screen_gaze import ScreenGaze, SURFACES
+from .screen_gaze import ScreenGaze, SURFACES, fuse_surfaces
+from .temporal_filter import FeatureSmoother, StableTarget
 
 
 def write_json(path, value):
@@ -61,6 +62,8 @@ class Experiment:
         self.frame_times = {}
         self.observations = {}
         self.predictions = {}
+        # Alvo mostrado na aba ao vivo, com histerese, por participante.
+        self.live_targets = {}
         self.classifier = TargetClassifier()
         self.pose_reference = {}
         self.samples = []
@@ -400,6 +403,8 @@ class Experiment:
         else:
             factory = self.extractor_factory
         extractors, processed, last_run = {}, {}, {}
+        # Filtro temporal por papel, recomeçado quando a câmera do papel muda.
+        smoothers = {}
         try:
             while not self.stop_event.is_set():
                 tick = time.perf_counter()
@@ -423,6 +428,15 @@ class Experiment:
                         observation = extractors[role].extract(frame.image, frame.capture)
                         vector, quality_reason = feature_status(observation)
                         screen_features, screen_quality_reason = screen_feature_status(observation)
+                        ear = getattr(observation, "ear", None)
+                        if smoothers.get(role, (None,))[0] != source:
+                            smoothers[role] = (source, FeatureSmoother())
+                        smooth = smoothers[role][1].update(
+                            frame.capture, None if screen_features is None or ear is None else list(screen_features) + [ear])
+                        # A calibração usa as leituras brutas; a estimativa ao vivo usa as suavizadas.
+                        smooth = None if smooth is None else {
+                            "screen_features": smooth[:4], "ear": smooth[4],
+                            "features": smooth[:4] if vector is not None else None}
                         with self.lock:
                             if self.assignments[role] != source:
                                 continue
@@ -437,7 +451,7 @@ class Experiment:
                                                        "face_count": getattr(observation, "face_count", 1),
                                                        "glabella": getattr(observation,"glabella",None),
                                                        "iris_diameter": getattr(observation,"iris_diameter",None),
-                                                       "ear": getattr(observation,"ear",None),
+                                                       "ear": ear, "smooth": smooth,
                                                        "direction": getattr(observation, "gaze_direction", None)}
                             cal = self.calibration
                             if (cal and cal["mode"] == "fit" and cal["started"] is not None
@@ -508,8 +522,11 @@ class Experiment:
                 if pose is None or max(abs(a - b) for a, b in zip(pose, self.pose_reference[role])) > 0.08:
                     reason = "cabeça do NAO mudou de pose; recalibre"
             tracking_valid = reason is None and observation is not None and observation.get("features") is not None
+            features = observation["features"] if observation else None
+            if features is not None and (observation.get("smooth") or {}).get("features") is not None:
+                features = observation["smooth"]["features"]
             prediction = ({"target": UNKNOWN, "score": 0, "reason": reason} if reason
-                          else self.classifier.predict(role, observation["features"]))
+                          else self.classifier.predict(role, features))
             prediction.update(tracking_valid=tracking_valid,
                               ear=observation.get("ear") if observation else None,
                               face_count=observation.get("face_count") if observation else 0,
@@ -562,9 +579,10 @@ class Experiment:
     def live_gaze(self, now=None, participant=None):
         """Para onde a pessoa olha, pelas calibrações de posição do participante escolhido.
 
-        Cada câmera calibrada vota na superfície (notebook, TV, robô) onde a sua
-        estimativa cai; sem estimativa dentro de nenhuma, vota em "outro local".
-        Sem calibrações de posição, usa o classificador de alvos, se houver.
+        Cada câmera compara a leitura com as zonas das superfícies que conhece (as dos
+        mapas dela e as cruzadas) e a decisão junta as câmeras pela certeza de cada uma
+        (screen_gaze.fuse_surfaces). Sem calibrações de posição, usa o classificador de
+        alvos, se houver.
         """
         now = time.perf_counter() if now is None else now
         self.live_viewer_seen = now
@@ -572,8 +590,8 @@ class Experiment:
         participant = participant or gaze.participant or self.calibration_participant
         labels = self.camera_labels()
         surfaces = {surface: {"calibrated": False, "estimates": []} for surface in SURFACES}
-        # known[câmera][superfície] = True (estimativa dentro) / False (leitura válida, fora).
-        known, parts = {}, {}
+        # evidence[câmera][superfície] = razão da leitura à zona daquela superfície (≤ 1 = dentro).
+        evidence, parts = {}, {}
         for key in sorted(gaze.models_for(participant)):
             surface, role = key.split(":")
             position = gaze.position(key, now, self.observations, labels, self.displays,
@@ -581,35 +599,27 @@ class Experiment:
             surfaces[surface]["calibrated"] = True
             surfaces[surface]["estimates"].append({**gaze.summary(key, participant), "gaze": position})
             if position["visible"] or position.get("outside"):
-                inside = bool(position.get("inside"))
-                known.setdefault(role, {})[surface] = inside
-                if inside and surface == "robot":
+                ratios = dict(position.get("zone_ratios") or {})
+                if ratios.get(surface) is None:
+                    # Mapa salvo antes das zonas: dentro/fora pelo próprio mapa.
+                    ratios[surface] = .5 if position.get("inside") else 2.
+                evidence.setdefault(role, {}).update(ratios)
+                if position.get("inside") and surface == "robot":
                     parts[role] = position["part"]
         names = {"notebook": "NOTEBOOK", "tv": "TV", "robot": "NAO"}
-        # Cada câmera só opina sobre as superfícies que calibrou: a favor quando a
-        # estimativa cai só nela; contra quando a leitura é válida e cai fora dela.
-        # Uma câmera sem mapa do robô não contradiz a câmera que vê o olhar no robô.
-        balance = {}
-        for surface in SURFACES:
-            support = sum(1 for seen in known.values() if seen.get(surface) is True and sum(seen.values()) == 1)
-            against = sum(1 for seen in known.values() if seen.get(surface) is False)
-            if support:
-                balance[surface] = (support - against, support, against)
         if any(item["calibrated"] for item in surfaces.values()):
-            best = max((b[0] for b in balance.values()), default=None)
-            winners = [s for s, b in balance.items() if b[0] == best]
-            if best is not None and best > 0 and len(winners) == 1:
-                surface = winners[0]
-                target = names[surface]
-                _, support, against = balance[surface]
-                reason = f"{support} câmera(s) a favor" + (f", {against} contra" if against else "")
-                score = support / len(known)
-            elif balance:
-                target, reason, score = UNKNOWN, "câmeras discordam", 0
-            elif known:
-                target, reason, score = "OUTRO_LOCAL", "fora das telas e do robô calibrados", 1
-            else:
+            # Cada câmera pesa pela certeza dela: uma câmera que não separa duas superfícies
+            # (a da TV, com o robô na frente da TV) pesa pouco; a que separa decide.
+            fused = fuse_surfaces(evidence)
+            if not fused["cameras"]:
                 target, reason, score = UNKNOWN, "sem leitura válida das câmeras calibradas", 0
+            elif not fused["decided"]:
+                target, reason, score = UNKNOWN, "câmeras discordam ou leitura ambígua", 0
+            elif fused["surface"] is None:
+                target, reason, score = "OUTRO_LOCAL", "fora das telas e do robô calibrados", fused["score"]
+            else:
+                target, score = names[fused["surface"]], fused["score"]
+                reason = f"{fused['support']} de {fused['cameras']} câmera(s) a favor"
             seen_parts = [part for part in parts.values() if part]
             part = max(set(seen_parts), key=seen_parts.count) if target == "NAO" and seen_parts else None
             source = "posição"
@@ -618,7 +628,20 @@ class Experiment:
             part = self.live.get("part") if target == "NAO" else None
             source = "classificador" if self.classifier.models else "nenhuma"
         surfaces["robot"].update(looking=target == "NAO", part=part)
+        # A dica "mais compatível com X" de uma câmera só aparece quando a decisão é X: a zona
+        # cruzada de uma câmera pode ser larga (ex.: o robô visto pela câmera da TV) e apontar
+        # uma superfície que as outras câmeras descartam. A opinião crua fica em camera_closer_to.
+        decided = {"NOTEBOOK": "notebook", "TV": "tv", "NAO": "robot"}.get(target)
+        for item in surfaces.values():
+            for estimate in item["estimates"]:
+                gaze_item = estimate["gaze"]
+                if gaze_item.get("closer_to") and gaze_item["closer_to"] != decided:
+                    gaze_item["camera_closer_to"], gaze_item["closer_to"] = gaze_item["closer_to"], None
+        # target/part são a decisão deste instante; stable é o que o painel mostra: um alvo
+        # novo precisa durar 0,35 s, e perder a leitura só apaga o anterior após 0,8 s.
+        stable = self.live_targets.setdefault(participant, StableTarget()).update(now, target, part)
         return {"target": target, "score": round(float(score), 3), "reason": reason, "source": source,
+                "stable": stable,
                 "participant": participant, "participants": gaze.participants(),
                 "classifier_ready": bool(self.classifier.models),
                 "screens": {d: surfaces[d] for d in ("notebook", "tv")}, "robot": surfaces["robot"],

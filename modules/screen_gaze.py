@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -54,6 +55,18 @@ def eyes_open(observation):
 
 def screen_vector(observation):
     return observation.get("screen_features", observation.get("features"))
+
+
+def live_view(observation):
+    """Leitura suavizada no tempo (ver temporal_filter), quando houver.
+
+    A validade e a piscada continuam decididas pelo quadro atual: sem leitura agora, não
+    se mostra um valor antigo do filtro.
+    """
+    smooth = observation.get("smooth")
+    if not smooth or smooth.get("screen_features") is None:
+        return observation
+    return {**observation, "screen_features": smooth["screen_features"], "ear": smooth["ear"]}
 
 
 def screen_reason(observation):
@@ -233,9 +246,41 @@ ROBOT_CANDIDATES = CANDIDATES[:2] + (("cabeca", ("hx", "hy")), ("cabeca_palpebra
 # A parte só é mostrada quando a validação daquela câmera acertou ao menos metade.
 ROBOT_PART_MIN_ACCURACY = .5
 # Zona: como ficam íris, cabeça e pálpebras olhando cada superfície. Mínimos de
-# dispersão evitam rejeitar pequenos ajustes de postura.
-ZONE_FLOORS = np.array([.012, .012, .03, .012, .02])
+# dispersão (gx, gy, hx, hy, EAR) evitam rejeitar ajustes naturais de postura: na
+# calibração a cabeça fica quase parada (o desvio de hy batia no mínimo antigo de
+# 0,012) e, no P030, só inclinar a cabeça na validação da TV (hy −0,08, EAR −0,09)
+# tirou o olhar da zona da TV nas câmeras da TV e do notebook. Com hx ,05, hy e
+# EAR ,07 (antes ,03/,012/,02), nos pontos de validação de P014, P016 e P030: alvo
+# certo 89% → 94%, errado 1,4% → 1,2%, ponto aceso em superfície errada 4,0% → 3,0%.
+ZONE_FLOORS = np.array([.012, .012, .05, .07, .07])
 ZONE_QUANTILE, ZONE_MARGIN = 97.5, 1.3
+# Zonas cruzadas: enquanto uma câmera calibra a sua superfície, as outras câmeras também
+# veem a pessoa olhando para ela. Essas leituras viram a zona daquela superfície para
+# cada uma das outras câmeras. Sem isso, uma câmera com um só mapa (ex.: a da TV só com
+# a TV) não distingue "olhando o notebook" de "olhando a TV" e projeta tudo na própria tela.
+CROSS_POSE_TOLERANCE = .08
+# Fusão pelas zonas. As zonas de uma câmera se sobrepõem quando duas superfícies ficam na
+# mesma direção para ela: no P014, olhando a TV, a câmera da TV via a leitura dentro da zona
+# da TV (razão mediana 0,40) e ainda mais dentro da zona do robô (0,27), porque o robô fica
+# à frente da TV. A câmera do NAO, ao contrário, separa bem TV e robô. Por isso cada câmera
+# transforma as razões em probabilidades e a decisão soma o log delas entre as câmeras; cada
+# câmera tira no máximo log 0,1 de uma superfície, para uma câmera sozinha não vetar as
+# outras, e é preciso margem de 1,5. "Fora de tudo" vale como uma leitura com razão 1,75:
+# logo depois de calibrar, a pessoa se reacomoda e uma leitura olhando a superfície cai
+# pouco fora da zona (no P016, 24% das leituras da câmera do notebook olhando o notebook);
+# com o limite em 1, isso virava "outro local".
+# Parâmetros escolhidos juntos em P014 e P016 (instantes sincronizados dos pontos de
+# validação, zonas ajustadas sem eles): 92% e 90% certos, 1,6% e 0,8% errados; a votação
+# anterior errava 8,4% e 3,5%. Não há leituras de "olhando outro lugar" nesses dados: a
+# taxa de acerto de "outro local" não foi medida.
+FUSION_SHARPNESS = 2.0
+FUSION_OUTSIDE_RATIO = 1.75
+FUSION_FLOOR = .1
+FUSION_MARGIN = 1.5
+# Na linha de cada câmera, outra superfície só tira o olhar desta quando é 2× mais provável.
+# Em P014 e P016 (instantes de validação), as linhas por câmera acertam 96% e 90%; a câmera
+# da TV olhando a TV diz "dentro" em 96% (antes dizia "mais compatível com o robô").
+CLEAR_WIN = 2.0
 
 
 def zone_vector(observation, center=None):
@@ -275,6 +320,61 @@ def fit_zone(rows):
     distances = np.sqrt(np.einsum("ij,jk,ik->i", z, inverse, z))
     return {"center": center.tolist(), "scale": scale.tolist(), "inverse": inverse.tolist(),
             "threshold": float(np.percentile(distances, ZONE_QUANTILE) * ZONE_MARGIN)}
+
+
+def zone_log_probabilities(ratios):
+    """{superfície: razão à zona} → {superfície: log-probabilidade, None: fora de todas}."""
+    logits = {s: -.5 * (FUSION_SHARPNESS * r) ** 2 for s, r in ratios.items() if r is not None}
+    logits[None] = -.5 * (FUSION_SHARPNESS * FUSION_OUTSIDE_RATIO) ** 2
+    top = max(logits.values())
+    total = top + math.log(sum(math.exp(v - top) for v in logits.values()))
+    return {s: v - total for s, v in logits.items()}
+
+
+def camera_opinion(surface, ratios):
+    """O que uma câmera diz da própria superfície, comparando com as outras zonas que conhece.
+
+    Dentro quando esta superfície é a mais provável (mesmo um pouco fora da zona, até a razão
+    de "fora de tudo"), ou quando a leitura está na zona dela e
+    a outra superfície não é CLEAR_WIN× mais provável (fica marcada como ambígua). "Mais compatível
+    com" só quando uma superfície ganha com folga de todas as outras.
+    """
+    if ratios.get(surface) is None:  # mapa sem zona (salvo antes delas): regra anterior
+        return {"in_zone": True, "closer_to": None, "ambiguous_with": None}
+    logp = zone_log_probabilities(ratios)
+    ranked = sorted(logp, key=logp.get, reverse=True)
+    top = ranked[0]
+    if top == surface:
+        return {"in_zone": True, "closer_to": None, "ambiguous_with": None}
+    if top is None:
+        return {"in_zone": False, "closer_to": None, "ambiguous_with": None}
+    lead = math.log(CLEAR_WIN)
+    if ratios[surface] <= 1 and logp[top] - logp[surface] < lead:
+        return {"in_zone": True, "closer_to": None, "ambiguous_with": top}
+    clear = len(ranked) == 1 or logp[top] - logp[ranked[1]] >= lead
+    return {"in_zone": False, "closer_to": top if clear else None, "ambiguous_with": None}
+
+
+def fuse_surfaces(evidence):
+    """Junta as câmeras: evidence = {câmera: {superfície: razão}}.
+
+    Uma superfície que a câmera não conhece recebe a probabilidade de "fora de todas" dela:
+    a câmera não tem como ser contra (nem a favor) de uma superfície que nunca viu.
+    """
+    opinions = {role: zone_log_probabilities(r) for role, r in evidence.items()
+                if any(v is not None for v in r.values())}
+    if not opinions:
+        return {"decided": False, "surface": None, "score": 0., "margin": 0., "support": 0, "cameras": 0}
+    floor = math.log(FUSION_FLOOR)
+    candidates = {s for logp in opinions.values() for s in logp}
+    score = {s: sum(max(logp.get(s, logp[None]), floor) for logp in opinions.values()) for s in candidates}
+    ranked = sorted(score, key=lambda s: (score[s], s is not None), reverse=True)
+    best = ranked[0]
+    margin = score[best] - score[ranked[1]] if len(ranked) > 1 else math.inf
+    posterior = 1 / sum(math.exp(v - score[best]) for v in score.values())
+    support = sum(1 for logp in opinions.values() if max(logp, key=logp.get) == best)
+    return {"decided": margin >= FUSION_MARGIN, "surface": best, "score": posterior, "margin": margin,
+            "support": support, "cameras": len(opinions)}
 
 
 def zone_ratio(zone, observation):
@@ -338,6 +438,7 @@ class ScreenGaze:
         self.participant = None
         self.calibration = None
         self.last_sequence = None
+        self.cross_seen = {}
         self.load()
 
     @property
@@ -415,8 +516,9 @@ class ScreenGaze:
                             "fit_points": fit_points, "check_points": check_points, "parts": parts,
                             "layout": None, "client": None, "pose": None,
                             "reason": "Abra esta tela, ative a visualização e acompanhe as indicações.",
-                            "validation": None, "include_check": include_check}
+                            "validation": None, "include_check": include_check, "cross": {}}
         self.last_sequence = None
+        self.cross_seen = {}
 
     def begin_check(self, surface, role, participant=None, screen=None):
         if self.active:
@@ -432,8 +534,9 @@ class ScreenGaze:
                             "participant": participant, "index": len(fit_points), "phase": "waiting", "started": None,
                             "samples": [], "checks": [], "attempt": 0, "include_check": True, "client": None,
                             "fit_points": fit_points, "check_points": check_points, "parts": parts,
-                            "reason": "Olhe para cada indicação até ela mudar", "validation": None}
+                            "reason": "Olhe para cada indicação até ela mudar", "validation": None, "cross": {}}
         self.last_sequence = None
+        self.cross_seen = {}
 
     def cue(self, now=None):
         now = time.perf_counter() if now is None else now
@@ -465,6 +568,8 @@ class ScreenGaze:
         if cal["started"] is not None:
             cal["samples"][:] = [r for r in cal["samples"] if r["step"] != cal["index"]]
             cal["checks"][:] = [r for r in cal["checks"] if r["step"] != cal["index"]]
+            for item in cal.get("cross", {}).values():
+                item["rows"][:] = [r for r in item["rows"] if r["step"] != cal["index"]]
             cal["attempt"] += 1
         cal.update(started=None, phase="waiting", reason=reason)
 
@@ -501,6 +606,7 @@ class ScreenGaze:
                         cal.update(layout=view["layout"], client=client, started=None, phase="waiting",
                                    attempt=cal["attempt"] + 1, reason="Tela estabilizada; preparando o primeiro ponto")
                         cal["samples"].clear()
+                        cal["cross"] = {}
                         return
                     # Antes, isso encerrava a calibração no ponto 8 ou 9. Agora só espera.
                     self._interrupt(cal, "A janela mudou de tamanho ou de monitor. Volte à tela cheia no mesmo monitor para continuar.")
@@ -530,6 +636,8 @@ class ScreenGaze:
             row = {"step": cal["index"], "features": list(screen_vector(obs)), "pose": obs.get("pose"),
                    **{k: obs.get(k) for k in ("capture", "sequence", "glabella", "iris_diameter", "ear")}}
             (cal["samples"] if cal["index"] < n_fit else cal["checks"]).append(row)
+        if settling <= elapsed <= 10:
+            self._collect_cross(cal, observations, labels, settling)
         cal["reason"] = (screen_reason(obs) or "Sem leitura válida dos olhos" if screen_vector(obs) is None
                          else "Incerteza de sincronização alta" if obs.get("uncertainty", 1) > .15
                          else "Olhos fechados ou piscando; mantenha os olhos abertos" if not eyes_open(obs)
@@ -571,6 +679,39 @@ class ScreenGaze:
         cal["validation"] = report
         self.store_model(cal)
         cal.update(phase="complete", reason=f"{self._fit_message(cal)} Validação: {self.validation_text(report)}.")
+
+    def _collect_cross(self, cal, observations, labels, settling):
+        """Leituras das outras câmeras enquanto a pessoa olha a indicação desta superfície."""
+        cross = cal.setdefault("cross", {})
+        for role, obs in observations.items():
+            source = labels.get(role)
+            if role == cal["role"] or not source or not obs:
+                continue
+            sequence = obs.get("sequence", obs["capture"])
+            if (self.cross_seen.get(role) == sequence or screen_vector(obs) is None
+                    or obs.get("uncertainty", 1) > .15 or not eyes_open(obs)
+                    or not cal["started"] + settling <= obs["capture"] <= cal["started"] + 10):
+                continue
+            self.cross_seen[role] = sequence
+            item = cross.setdefault(role, {"source": source, "rows": []})
+            if item["source"] != source:  # câmera trocada no meio: recomeça
+                item.update(source=source, rows=[])
+            item["rows"].append({"step": cal["index"], "features": list(screen_vector(obs)), "ear": obs.get("ear"),
+                                 "pose": obs.get("pose"), "capture": obs["capture"]})
+
+    @staticmethod
+    def _cross_zones(cal):
+        """Zona desta superfície vista por cada outra câmera; mantém as anteriores sem dados novos."""
+        zones = dict(cal.get("cross_zones") or {})
+        for role, item in (cal.get("cross") or {}).items():
+            poses = [r["pose"] for r in item["rows"] if r.get("pose") is not None]
+            if poses and float(np.max(np.ptp(poses, axis=0))) > .10:
+                continue  # a cabeça do NAO mexeu durante a calibração
+            zone = fit_zone(item["rows"])
+            if zone:
+                zones[role] = {"source": item["source"], "zone": zone, "samples": len(item["rows"]),
+                               "pose": np.median(poses, axis=0).tolist() if poses else None}
+        return zones
 
     @staticmethod
     def _fit_message(cal):
@@ -627,6 +768,7 @@ class ScreenGaze:
         model = {k: cal.get(k) for k in ("map", "role", "surface", "screen", "source", "participant", "validation",
                                          "layout", "client", "pose", "zone")}
         model["calibration_id"] = cal["id"]
+        model["cross_zones"] = self._cross_zones(cal)
         self.library.setdefault(cal["participant"], {})[model_key(cal["surface"], cal["role"])] = model
         self.participant = cal["participant"]
         try:
@@ -660,7 +802,8 @@ class ScreenGaze:
                 return hidden("A pose da câmera do NAO mudou; refaça o mapa")
         if model["map"].is_blink(obs.get("ear")):
             return hidden("Piscada ou olhos semicerrados")
-        zone = self.zone_decision(key, model, obs, participant)
+        obs = live_view(obs)
+        zone = self.zone_decision(key, model, obs, participant, labels)
         point = model["map"].predict(screen_vector(obs), geometry=obs)
         if point is None:
             # Leitura válida, mas muito longe desta superfície: conta como "fora dela".
@@ -685,21 +828,34 @@ class ScreenGaze:
             result["inside"] = zone["in_zone"] and inside_screen(point, .15 if zone["zone_ratio"] is not None else SCREEN_MARGIN)
         return result
 
-    def zone_decision(self, key, model, observation, participant=None):
-        """A leitura pertence a esta superfície? Compara com as zonas dos outros mapas da mesma câmera."""
-        ratio = zone_ratio(model.get("zone"), observation)
-        competitor, best = None, None
-        for other_key, other in self.models_for(participant).items():
-            if other_key == key or other["role"] != model["role"]:
-                continue
-            other_ratio = zone_ratio(other.get("zone"), observation)
-            if other_ratio is not None and (best is None or other_ratio < best):
-                competitor, best = other["surface"], other_ratio
-        in_zone = ratio is None or ratio <= 1
-        closer = None
-        if ratio is not None and best is not None and best <= 1 and best < ratio:
-            in_zone, closer = False, competitor
-        return {"zone_ratio": ratio, "in_zone": in_zone, "closer_to": closer}
+    def zone_decision(self, key, model, observation, participant=None, labels=None):
+        """A leitura pertence a esta superfície? Compara com as zonas das outras superfícies
+        vistas por esta mesma câmera: as dos mapas dela e as zonas cruzadas das outras câmeras."""
+        ratios = self.camera_ratios(model["role"], observation, participant, labels)
+        return {"zone_ratio": ratios.get(model["surface"]), "zone_ratios": ratios,
+                **camera_opinion(model["surface"], ratios)}
+
+    def camera_ratios(self, role, observation, participant=None, labels=None):
+        """Razão da leitura de uma câmera à zona de cada superfície que ela conhece."""
+        ratios = {}
+        for other in self.models_for(participant).values():
+            zone = (other.get("zone") if other["role"] == role
+                    else self._cross_zone(other, role, observation, labels))
+            ratio = zone_ratio(zone, observation)
+            if ratio is not None and ratio < ratios.get(other["surface"], math.inf):
+                ratios[other["surface"]] = ratio
+        return ratios
+
+    @staticmethod
+    def _cross_zone(other, role, observation, labels):
+        item = (other.get("cross_zones") or {}).get(role)
+        if not item or (labels is not None and labels.get(role) != item["source"]):
+            return None
+        if item.get("pose") is not None:
+            pose = observation.get("pose")
+            if pose is None or max(abs(a - b) for a, b in zip(pose, item["pose"])) > CROSS_POSE_TOLERANCE:
+                return None
+        return item["zone"]
 
     def checking_position(self, display, now, observations):
         cal = self.calibration
