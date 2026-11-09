@@ -21,8 +21,9 @@
       <nav aria-label="Navegação principal">
         <button class="nav active" data-tab="capture"><b>01</b> Câmeras e sessão</button>
         <button class="nav" data-tab="live"><b>02</b> Olhar ao vivo</button>
-        <button class="nav" data-tab="review"><b>03</b> Validação humana</button>
-        <button class="nav" data-tab="connect"><b>04</b> Conectar dispositivos</button>
+        <button class="nav" data-tab="dashboard"><b>03</b> Dados e análises</button>
+        <button class="nav" data-tab="review"><b>04</b> Validação humana</button>
+        <button class="nav" data-tab="connect"><b>05</b> Conectar dispositivos</button>
       </nav>
       <div class="side-note"><span class="dot"></span> Processamento no servidor<p>Estimativa do alvo visual.<br>Não mede compreensão ou atenção cognitiva.</p></div>
       <button id="logout" class="ghost">Sair do painel</button>
@@ -91,6 +92,26 @@
         </div>
         <div class="panel live-legend"><p class="small"><strong>Como ler:</strong> cada câmera calibrada tem a sua cor: <span class="cam-dot" style="background:rgb(99,221,255)"></span> notebook · <span class="cam-dot" style="background:rgb(199,155,255)"></span> NAO · <span class="cam-dot" style="background:rgb(255,207,104)"></span> apresentação. O círculo é a posição estimada e o rastro mostra os últimos 2 segundos. No robô, a parte destacada é a que as câmeras indicam. A borda verde marca o alvo escolhido pelas câmeras: cada câmera vota na tela ou no robô onde a estimativa dela cai.</p><p class="small muted">Os mapas vêm da página de alvo (<a href="/alvo?display=notebook" target="_blank" rel="noopener">notebook</a> · <a href="/alvo?display=tv" target="_blank" rel="noopener">TV</a>), um por câmera, e ficam salvos por participante. É uma estimativa por webcam (normalmente 150 a 450 px de erro numa tela de notebook). Não confirma atenção nem compreensão. Esta aba não precisa da página de alvo aberta durante a apresentação.</p></div>
       </section>
+      <section id="tab-dashboard" class="tab" hidden>
+        <div class="section-heading"><div><h2>Resumo do experimento</h2><p>Dados estruturados no SQLite local; imagens e JSONL permanecem como registros brutos.</p></div><div class="button-row"><button id="refresh-dashboard" class="secondary">Atualizar</button><a class="button secondary" href="/api/dashboard/summary.csv">Exportar resumo CSV</a></div></div>
+        <div id="dashboard-overview" class="metrics dashboard-overview"></div>
+        <article class="panel dashboard-filter"><label>Sessão analisada<select id="dashboard-session"><option value="">Nenhuma sessão disponível</option></select></label><p id="dashboard-session-info" class="small muted"></p></article>
+        <div id="dashboard-content" hidden>
+          <div class="two-columns dashboard-columns">
+            <article class="panel"><h2>Tempo por alvo visual</h2><p class="small muted">Duração estimada pelas previsões; lacunas acima de 0,5 s aparecem como indeterminadas.</p><div id="target-distribution" class="distribution"></div></article>
+            <article class="panel"><h2>Estados temporais observados</h2><p class="small muted">Intervalos confirmados pela regra temporal. “Baixa atividade” é uma medida descritiva, não um diagnóstico de desatenção.</p><div id="attention-state-distribution" class="distribution"></div></article>
+          </div>
+          <div class="two-columns dashboard-columns">
+            <article class="panel"><h2>Qualidade por câmera</h2><p class="small muted">Perda de dados significa ausência de rastreamento facial/ocular válido, separada da classificação do alvo.</p><div id="camera-quality"></div></article>
+            <article class="panel"><h2>Critérios registrados</h2><p class="small muted">Dispersão externa e olhos fechados exigem 2 s contínuos e têm início retroativo. Os limiares completos ficam nos metadados da sessão.</p><div class="method-note"><strong>Atividade do olhar</strong><span>Janela de 5 s, amostrada a 3 Hz; o limiar deve ser definido pelo estudo-piloto.</span></div></article>
+          </div>
+          <div class="two-columns dashboard-columns">
+            <article class="panel"><h2>Marcos da sessão</h2><div id="dashboard-events" class="dashboard-events small"></div></article>
+            <article class="panel"><h2>Validação humana</h2><div id="dashboard-reports" class="small"></div></article>
+          </div>
+        </div>
+        <article class="panel"><h2>Sessões armazenadas</h2><div class="table-scroll"><table><thead><tr><th>Participante</th><th>Início</th><th>Duração</th><th>Previsões</th><th>Quadros</th><th>Status</th><th></th></tr></thead><tbody id="dashboard-sessions"></tbody></table></div></article>
+      </section>
       <section id="tab-review" class="tab" hidden>
         <div class="section-heading"><div><h2>Revisão independente</h2><p>Anote os intervalos antes de consultar o resultado automático.</p></div><button id="refresh-sessions" class="secondary">Atualizar sessões</button></div>
         <div class="panel"><label>Sessão gravada<select id="session-list"><option value="">Selecione uma sessão</option></select></label><p id="session-info" class="small muted">As gravações finalizadas aparecem aqui.</p></div>
@@ -100,6 +121,16 @@
             <article class="panel"><h2>Anotar o alvo visual</h2><p class="small muted">Use Indeterminado quando o vídeo não permitir decidir. Intervalos do mesmo avaliador não podem se sobrepor.</p><div class="button-row"><label class="grow">Avaliador<input id="annotator" value="A01" maxlength="80"></label><button id="load-annotations" class="secondary">Carregar anotações</button></div><div class="interval-inputs"><label>Início (s)<input id="interval-start" type="number" min="0" step="0.05" value="0"></label><label>Fim (s)<input id="interval-end" type="number" min="0" step="0.05" value="1"></label></div><div class="button-row"><button id="mark-start" class="secondary">Usar tempo no início</button><button id="mark-end" class="secondary">Usar tempo no fim</button></div><label>Alvo observado<select id="interval-target"><option>NOTEBOOK</option><option>TV</option><option>NAO</option><option>OUTRO_LOCAL</option><option>INDETERMINADO</option></select></label><button id="add-interval">Adicionar intervalo</button><div id="annotation-list" class="annotation-list"></div><div class="button-row"><button id="save-annotations" class="secondary">Salvar anotações</button><button id="evaluate">Calcular validação</button></div><p id="annotation-status" class="small muted"></p></article>
           </div>
           <article id="validation-report" class="panel" hidden></article>
+          <article class="panel">
+            <h2>Concordância entre avaliadores</h2>
+            <p class="small muted">Compare duas anotações independentes. As previsões automáticas permanecem ocultas e não participam do cálculo.</p>
+            <div class="agreement-controls">
+              <label>Avaliador 1<select id="agreement-first"><option value="">Salve duas anotações</option></select></label>
+              <label>Avaliador 2<select id="agreement-second"><option value="">Salve duas anotações</option></select></label>
+              <div class="button-row"><button id="compare-annotators">Calcular concordância</button><button id="prepare-consensus" class="secondary" disabled>Preparar consenso</button></div>
+            </div>
+            <div id="agreement-report" hidden></div>
+          </article>
           <div class="button-row"><a id="csv-download" class="button secondary" href="#">Exportar previsões CSV</a><button id="report-download" class="secondary" disabled>Exportar relatório JSON</button></div>
         </div>
       </section>

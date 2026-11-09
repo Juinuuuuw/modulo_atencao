@@ -13,7 +13,9 @@ import numpy as np
 from modules.multicamera import Experiment, Frame
 from modules.calibration_protocol import calibration_plan
 from modules.target_classifier import TARGETS, UNKNOWN, TargetClassifier, fuse
-from modules.validation import evaluate_checks, evaluate_intervals, validate_annotations
+from modules.validation import (evaluate_checks, evaluate_intervals,
+                                evaluate_temporal_events, temporal_iou, compare_annotators,
+                                validate_annotations)
 from server import create_app
 
 
@@ -245,6 +247,37 @@ class GuidedCalibrationTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_inter_annotator_agreement_uses_joint_determined_time(self):
+        first = [{"start": 0, "end": 2, "target": "TV"},
+                 {"start": 2, "end": 4, "target": "NAO"}]
+        second = [{"start": 0, "end": 1, "target": "TV"},
+                  {"start": 1, "end": 3, "target": "NAO"},
+                  {"start": 3, "end": 4, "target": "INDETERMINADO"}]
+        result = compare_annotators(first, second, 5, "A01", "A02")
+        self.assertEqual(result["joint_seconds"], 4)
+        self.assertEqual(result["comparable_seconds"], 3)
+        self.assertAlmostEqual(result["agreement"], 2 / 3)
+        self.assertEqual(result["indeterminate_seconds"], 1)
+        self.assertEqual(len(result["disagreements"]), 2)
+        self.assertTrue(any(row["needs_review"] for row in result["consensus_draft"]))
+
+    def test_perfect_inter_annotator_agreement_has_unit_kappa(self):
+        rows = [{"start": 0, "end": 2, "target": "TV"},
+                {"start": 2, "end": 4, "target": "NAO"}]
+        result = compare_annotators(rows, rows, 4, "A01", "A02")
+        self.assertEqual(result["agreement"], 1)
+        self.assertEqual(result["kappa"], 1)
+        self.assertEqual(result["disagreements"], [])
+
+    def test_temporal_iou_and_event_matching(self):
+        self.assertAlmostEqual(temporal_iou({"start": 0, "end": 4},
+                                            {"start": 2, "end": 6}), 1 / 3)
+        result = evaluate_temporal_events(
+            [{"start": 0, "end": 4, "state": "EM_FOCO_TV"}],
+            [{"start": 0, "end": 4, "target": "TV"}], 4)
+        self.assertEqual(result["thresholds"]["0.7"]["tp"], 1)
+        self.assertEqual(result["thresholds"]["0.7"]["f1"], 1)
+
     def test_task_verification_is_reported_separately_from_exact_target(self):
         result=evaluate_checks([{'expected':'TV','target':UNKNOWN,'regions':{'task':{'target':'DENTRO'}}}])
         self.assertEqual(result['accuracy'],0)
@@ -369,6 +402,13 @@ class ServerTests(unittest.TestCase):
         self.exp.tick(time.perf_counter())
         self.client.post("/api/events",json={"kind":"DECISAO_NOTEBOOK","note":"cena 1"},headers=self.headers)
         self.client.post("/api/recording/stop",headers=self.headers)
+        dashboard = self.client.get(f"/api/dashboard?session_id={session_id}", headers=self.headers)
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(dashboard.json["selected"]["id"], session_id)
+        self.assertEqual(dashboard.json["overview"]["sessions"], 1)
+        self.assertIn("attention_states", dashboard.json["selected"])
+        summary = self.client.get("/api/dashboard/summary.csv", headers=self.headers)
+        self.assertIn(session_id, summary.data.decode("utf-8-sig"))
         details = self.client.get(f"/api/sessions/{session_id}",headers=self.headers).json
         self.assertEqual(len(details["frames"]),3)
         self.assertEqual(details["events"][0]["kind"],"DECISAO_NOTEBOOK")
@@ -380,10 +420,34 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(result.status_code,200)
         self.assertAlmostEqual(result.json["total"],duration)
         self.assertEqual(result.json["coverage"],0)
+        response = self.client.post(f"/api/sessions/{session_id}/annotations",headers=self.headers,
+            json={"annotator":"A02","intervals":[{"start":0,"end":duration,"target":"TV"}]})
+        self.assertEqual(response.status_code,200)
+        agreement = self.client.get(
+            f"/api/sessions/{session_id}/agreement?first=A01&second=A02", headers=self.headers)
+        self.assertEqual(agreement.status_code,200)
+        self.assertEqual(agreement.json["agreement"],1)
+        incomplete = self.client.post(f"/api/sessions/{session_id}/consensus", headers=self.headers,
+            json={"first":"A01","second":"A02","annotator":"CONSENSO_INCOMPLETO",
+                  "intervals":[]})
+        self.assertEqual(incomplete.status_code,400)
+        consensus = self.client.post(f"/api/sessions/{session_id}/consensus", headers=self.headers,
+            json={"first":"A01","second":"A02","annotator":"CONSENSO_A01_A02",
+                  "intervals":[{"start":0,"end":duration,"target":"TV"}]})
+        self.assertEqual(consensus.status_code,200)
+        consensus_report = self.client.get(
+            f"/api/sessions/{session_id}/report?annotator=CONSENSO_A01_A02", headers=self.headers)
+        self.assertEqual(consensus_report.status_code,200)
+        reports = json.loads((Path(self.directory.name)/session_id/"reports.json").read_text())
+        self.assertIn("A01", reports)
+        self.assertIn("CONSENSO_A01_A02", reports)
         with self.client.get(f"/api/sessions/{session_id}/frame/validation/2",headers=self.headers) as response:
             self.assertEqual(response.status_code,200)
         export = self.client.get(f"/api/sessions/{session_id}/predictions.csv",headers=self.headers)
         self.assertIn("t_seconds",export.data.decode("utf-8-sig"))
+        self.assertIn("validation",export.data.decode("utf-8-sig").splitlines()[0])
+        self.assertIn("attention_state",export.data.decode("utf-8-sig").splitlines()[0])
+        self.assertTrue((Path(self.directory.name)/session_id/"attention_events.jsonl").exists())
         self.assertTrue((Path(self.directory.name)/session_id/"report.json").exists())
         wrong_participant = self.client.post("/api/recording/start",json={"participant":"P002"},headers=self.headers)
         self.assertEqual(wrong_participant.status_code,400)

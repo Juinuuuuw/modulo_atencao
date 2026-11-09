@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import sqlite3
 import threading
 import time
 import webbrowser
@@ -25,7 +26,9 @@ from werkzeug.exceptions import HTTPException
 from modules.multicamera import Experiment, read_lines, write_json
 from modules.target_classifier import ROLES
 from modules.screen_gaze import SURFACES, model_key
-from modules.validation import evaluate_intervals, validate_annotations
+from modules.storage import AnalysisStore
+from modules.validation import (compare_annotators, evaluate_intervals,
+                                evaluate_temporal_events, validate_annotations)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -53,6 +56,19 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
             rows = read_lines(path.parent / "frames.jsonl") + read_lines(path.parent / "predictions.jsonl")
             metadata.update(status="interrupted", duration=max((r["t"] for r in rows), default=0))
             write_json(path, metadata)
+    analysis = AnalysisStore(experiment.output)
+    try:
+        analysis.sync_all()
+    except (OSError, ValueError, sqlite3.DatabaseError):
+        app.logger.exception("Não foi possível atualizar o índice analítico na inicialização")
+    app.extensions["analysis_store"] = analysis
+
+    def sync_analysis(session_id):
+        # O índice é secundário: uma falha nele nunca invalida a gravação bruta.
+        try:
+            analysis.sync_session(session_id)
+        except (OSError, ValueError, sqlite3.DatabaseError):
+            app.logger.exception("Não foi possível indexar a sessão %s", session_id)
     if start_worker:
         experiment.start_worker()
         atexit.register(experiment.close)
@@ -373,12 +389,14 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
         data = body()
         with experiment.lock:
             session_id = experiment.start_recording(str(data.get("participant", "")).strip(), str(data.get("override", "")))
+        sync_analysis(session_id)
         return jsonify(id=session_id)
 
     @app.post("/api/recording/stop")
     def stop():
         with experiment.lock:
             session_id = experiment.stop_recording()
+        sync_analysis(session_id)
         return jsonify(id=session_id)
 
     @app.post("/api/events")
@@ -402,9 +420,13 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
         with experiment.lock:
             path = session_path(session_id)
             meta = json.loads((path / "session.json").read_text(encoding="utf-8"))
+            annotation_metadata_path = path / "annotation_metadata.json"
+            annotation_metadata = (json.loads(annotation_metadata_path.read_text(encoding="utf-8"))
+                                   if annotation_metadata_path.exists() else {})
             return jsonify(metadata=meta, frames=read_lines(path / "frames.jsonl"),
                            events=read_lines(path / "events.jsonl"),
-                           annotations=json.loads((path / "annotations.json").read_text(encoding="utf-8")))
+                           annotations=json.loads((path / "annotations.json").read_text(encoding="utf-8")),
+                           annotation_metadata=annotation_metadata)
 
     @app.get("/api/sessions/<session_id>/frame/<role>/<int:sequence>")
     def recorded_frame(session_id, role, sequence):
@@ -426,6 +448,7 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
             annotations = json.loads((path / "annotations.json").read_text(encoding="utf-8"))
             annotations[annotator] = validate_annotations(data["intervals"], meta["duration"])
             write_json(path / "annotations.json", annotations)
+        sync_analysis(session_id)
         return jsonify(ok=True)
 
     @app.get("/api/sessions/<session_id>/report")
@@ -440,19 +463,105 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
             if annotator not in annotations:
                 raise ValueError("Salve as anotações desse avaliador primeiro")
             value = evaluate_intervals(read_lines(path / "predictions.jsonl"), annotations[annotator], meta["duration"])
+            value["temporal_iou"] = evaluate_temporal_events(
+                read_lines(path / "attention_events.jsonl"), annotations[annotator], meta["duration"])
             value.update(annotator=annotator, session_id=session_id)
-            write_json(path / "report.json", value)
-            return jsonify(value)
+            reports_path = path / "reports.json"
+            reports = (json.loads(reports_path.read_text(encoding="utf-8"))
+                       if reports_path.exists() else {})
+            reports[annotator] = value
+            write_json(reports_path, reports)
+            write_json(path / "report.json", value)  # compatibilidade com sessoes antigas
+        sync_analysis(session_id)
+        return jsonify(value)
+
+    @app.get("/api/sessions/<session_id>/agreement")
+    def agreement(session_id):
+        with experiment.lock:
+            path = session_path(session_id)
+            meta = json.loads((path / "session.json").read_text(encoding="utf-8"))
+            annotations = json.loads((path / "annotations.json").read_text(encoding="utf-8"))
+            first, second = request.args.get("first", ""), request.args.get("second", "")
+            if first not in annotations or second not in annotations:
+                raise ValueError("Selecione dois avaliadores com anotacoes salvas")
+            value = compare_annotators(annotations[first], annotations[second], meta["duration"],
+                                       first_name=first, second_name=second)
+            value.update(session_id=session_id)
+        return jsonify(value)
+
+    @app.post("/api/sessions/<session_id>/consensus")
+    def save_consensus(session_id):
+        data = body()
+        first, second = str(data.get("first", "")).strip(), str(data.get("second", "")).strip()
+        annotator = str(data.get("annotator", "")).strip()
+        if not annotator or len(annotator) > 80 or annotator in (first, second):
+            raise ValueError("Informe um identificador exclusivo para o consenso")
+        with experiment.lock:
+            path = session_path(session_id)
+            meta = json.loads((path / "session.json").read_text(encoding="utf-8"))
+            annotations = json.loads((path / "annotations.json").read_text(encoding="utf-8"))
+            if first not in annotations or second not in annotations or first == second:
+                raise ValueError("Selecione dois avaliadores diferentes com anotacoes salvas")
+            intervals = validate_annotations(data.get("intervals", []), meta["duration"])
+            comparison = compare_annotators(annotations[first], annotations[second], meta["duration"],
+                                            first_name=first, second_name=second)
+            expected = comparison["consensus_draft"]
+            expected_seconds = sum(row["end"] - row["start"] for row in expected)
+            saved_seconds = sum(row["end"] - row["start"] for row in intervals)
+            covered_seconds = sum(max(0.0, min(row["end"], reference["end"])
+                                      - max(row["start"], reference["start"]))
+                                  for row in intervals for reference in expected)
+            if (abs(saved_seconds - expected_seconds) > 0.001
+                    or abs(covered_seconds - expected_seconds) > 0.001):
+                raise ValueError("O consenso deve cobrir exatamente o tempo anotado pelos dois avaliadores")
+            annotations[annotator] = intervals
+            write_json(path / "annotations.json", annotations)
+            metadata_path = path / "annotation_metadata.json"
+            metadata = (json.loads(metadata_path.read_text(encoding="utf-8"))
+                        if metadata_path.exists() else {})
+            metadata[annotator] = {"kind": "consensus", "sources": [first, second]}
+            write_json(metadata_path, metadata)
+        sync_analysis(session_id)
+        return jsonify(ok=True, annotator=annotator)
+
+    @app.get("/api/dashboard")
+    def dashboard():
+        requested = request.args.get("session_id") or None
+        if requested is not None:
+            session_path(requested)
+        return jsonify(analysis.dashboard(requested))
+
+    @app.get("/api/dashboard/summary.csv")
+    def dashboard_csv():
+        value = analysis.dashboard()
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer)
+        writer.writerow(["session_id", "participant", "started_utc", "duration_seconds",
+                         "status", "prediction_samples", "frames"])
+        for row in value["sessions"]:
+            writer.writerow([row["id"], row["participant"], row["started_utc"], row["duration"],
+                             row["status"], row["predictions"], row["frames"]])
+        return send_file(io.BytesIO(buffer.getvalue().encode("utf-8-sig")), mimetype="text/csv",
+                         as_attachment=True, download_name="observa-resumo-sessoes.csv")
 
     @app.get("/api/sessions/<session_id>/predictions.csv")
     def predictions_csv(session_id):
         rows = read_lines(session_path(session_id) / "predictions.jsonl")
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer)
-        writer.writerow(["t_seconds", "target", "score", "reason", "notebook", "nao"])
+        writer.writerow(["t_seconds", "target", "score", "reason", "attention_state",
+                         "ear", "ear_threshold", "gaze_activity", "notebook", "nao", "validation",
+                         "tracking_valid_json", "screen_gaze_json"])
         for row in rows:
+            attention = row.get("attention") or {}
+            cameras = row.get("cameras") or {}
             writer.writerow([row["t"], row["target"], row["score"], row["reason"],
-                             row["cameras"]["notebook"]["target"], row["cameras"]["nao"]["target"]])
+                             attention.get("state"), attention.get("ear"),
+                             attention.get("ear_threshold"), attention.get("gaze_activity")] +
+                            [cameras.get(role, {}).get("target") for role in ROLES] +
+                            [json.dumps({role: bool(cameras.get(role, {}).get("tracking_valid"))
+                                         for role in ROLES}, ensure_ascii=False, separators=(",", ":"))] +
+                            [json.dumps(row.get("screen_gaze"), ensure_ascii=False, separators=(",", ":"))])
         return send_file(io.BytesIO(buffer.getvalue().encode("utf-8-sig")), mimetype="text/csv",
                          as_attachment=True, download_name=f"{session_id}-predictions.csv")
 

@@ -4,8 +4,10 @@ const roles = ["notebook", "nao", "validation"];
 const labels = ["NOTEBOOK", "TV", "NAO", "OUTRO_LOCAL", "INDETERMINADO"];
 const names = {NOTEBOOK:"Notebook", TV:"Apresentação / TV", NAO:"Robô NAO", OUTRO_LOCAL:"Outro local", INDETERMINADO:"Indeterminado"};
 let state, activeTab = "capture", sourceSignature = "", sourceInitialized = false, authenticated = false;
+const attentionNames = {EM_FOCO_NOTEBOOK:"Foco no notebook",EM_FOCO_TV:"Foco na apresenta\u00e7\u00e3o",EM_FOCO_ROBO:"Foco no rob\u00f4",DISPERSAO_EXTERNA:"Dispers\u00e3o externa",SLEEPY:"Olhos fechados prolongadamente",BAIXA_ATIVIDADE_DO_OLHAR:"Baixa atividade do olhar",INDETERMINADO:"Indeterminado"};
 let participantInitialized=false;
 let selectedSession = null, annotations = [], report = null, playing = false, playOrigin = 0, dirty = false;
+let agreementReport = null, consensusSources = null;
 let frameIndex = {}, lastFrameKey = "", loadedAnnotator = "";
 const previewInFlight = new Set();
 const previewSequences = {};
@@ -71,12 +73,58 @@ document.querySelectorAll("[data-tab]").forEach(button => button.addEventListene
   activeTab = button.dataset.tab;
   document.querySelectorAll(".tab").forEach(tab => { tab.hidden = tab.id !== `tab-${activeTab}`; });
   document.querySelectorAll(".nav").forEach(nav => nav.classList.toggle("active", nav === button));
-  $("page-title").textContent = {capture:"Câmeras e sessão",live:"Olhar ao vivo",review:"Validação humana",connect:"Conectar dispositivos"}[activeTab];
+  $("page-title").textContent = {capture:"Câmeras e sessão",live:"Olhar ao vivo",dashboard:"Dados e análises",review:"Validação humana",connect:"Conectar dispositivos"}[activeTab];
   placeCameras();
   if (activeTab === "live") { resetLiveTrails(); resizeLiveCanvases(); }
   if (activeTab !== "review") stopPlayback();
+  if (activeTab === "dashboard") refreshDashboard().catch(error => notice(error.message, true));
   if (activeTab === "review") refreshSessions().catch(error => notice(error.message, true));
 }));
+
+// ---- Dados e análises: consultas agregadas no índice SQLite local ----
+const cameraDisplayNames = {notebook:"Notebook",nao:"Robô NAO",validation:"Apresentação"};
+let dashboardData = null;
+function dashboardDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("pt-BR", {dateStyle:"short",timeStyle:"short"});
+}
+function renderDashboard() {
+  const data = dashboardData, overview = data.overview;
+  $("dashboard-overview").innerHTML = [["Sessões",overview.sessions],["Participantes",overview.participants],
+    ["Tempo coletado",clock(overview.duration)],["Previsões",Number(overview.predictions).toLocaleString("pt-BR")]]
+    .map(([label,value])=>`<div class="metric"><strong>${esc(value)}</strong><span>${label}</span></div>`).join("");
+  const select = $("dashboard-session"), previous = data.selected?.id || select.value;
+  select.innerHTML = data.sessions.map(row=>`<option value="${esc(row.id)}">${esc(row.participant)} · ${dashboardDate(row.started_utc)}</option>`).join("") || '<option value="">Nenhuma sessão disponível</option>';
+  if (previous && data.sessions.some(row=>row.id===previous)) select.value=previous;
+  $("dashboard-sessions").innerHTML = data.sessions.map(row=>`<tr><td>${esc(row.participant)}</td><td>${dashboardDate(row.started_utc)}</td><td>${clock(row.duration||0)}</td><td>${Number(row.predictions).toLocaleString("pt-BR")}</td><td>${Number(row.frames).toLocaleString("pt-BR")}</td><td>${esc(row.status)}</td><td><button class="secondary dash-open" data-session="${esc(row.id)}">Analisar</button></td></tr>`).join("") || '<tr><td colspan="7">Nenhuma sessão foi indexada ainda.</td></tr>';
+  const selected = data.selected;
+  $("dashboard-content").hidden = !selected;
+  $("dashboard-session-info").textContent = selected ? `${selected.participant} · ${clock(selected.duration||0)} · ${Number(selected.predictions).toLocaleString("pt-BR")} previsões · ${Number(selected.frames).toLocaleString("pt-BR")} quadros` : "Finalize uma gravação para visualizar as análises.";
+  if (!selected) return;
+  const duration = Math.max(.001, Number(selected.duration||0));
+  $("target-distribution").innerHTML = labels.map(target=>{
+    const value=Number(selected.target_seconds[target]||0);
+    return `<div class="distribution-row"><div><span class="chart-dot target-${target}"></span><strong>${names[target]}</strong><span>${seconds(value)} s · ${pct(value/duration)}</span></div><progress class="analysis-progress target-${target}" max="${duration}" value="${value}">${pct(value/duration)}</progress></div>`;
+  }).join("");
+  const attentionStates=selected.attention_states||[], attentionTotal=attentionStates.reduce((sum,row)=>sum+Number(row.duration||0),0);
+  $("attention-state-distribution").innerHTML = attentionStates.map(row=>{
+    const value=Number(row.duration||0), share=attentionTotal?value/attentionTotal:null;
+    return `<div class="distribution-row"><div><strong>${esc(attentionNames[row.state]||row.state)}</strong><span>${seconds(value)} s · ${pct(share)} · ${Number(row.events||0)} intervalo(s)</span></div><progress class="analysis-progress" max="${Math.max(.001,attentionTotal)}" value="${value}">${pct(share)}</progress></div>`;
+  }).join("") || '<p class="muted">Esta sess\u00e3o ainda n\u00e3o possui estados temporais registrados.</p>';
+  $("camera-quality").innerHTML = Object.entries(selected.cameras).map(([role,value])=>{
+    const total=value.samples||0, valid=value.valid_samples||0, validRatio=total?valid/total:null;
+    return `<div class="camera-quality-row"><div><strong>${esc(cameraDisplayNames[role]||role)}</strong><span>${total.toLocaleString("pt-BR")} amostras · ${pct(value.data_loss)} de perda</span></div><progress class="analysis-progress" max="${Math.max(1,total)}" value="${valid}">${pct(validRatio)} v\u00e1lidas</progress></div>`;
+  }).join("");
+  $("dashboard-events").innerHTML = selected.events.map(row=>`<p><strong>${seconds(row.t)} s · ${esc(row.kind)}</strong><br>${esc(row.note||"Sem nota")}</p>`).join("") || '<p class="muted">Nenhum marco registrado.</p>';
+  $("dashboard-reports").innerHTML = selected.reports.map(row=>`<div class="report-summary"><strong>${esc(row.annotator)}</strong><span>Acurácia ${pct(row.accuracy)} · cobertura ${pct(row.coverage)} · macro F1 ${pct(row.macro_f1)} · kappa ${row.kappa==null?"—":Number(row.kappa).toFixed(3)}</span><span>IoU temporal média ${pct(row.temporal_mean_iou)} · F1 temporal @ 0,5 ${pct(row.temporal_f1_05)}</span></div>`).join("") || '<p class="muted">Calcule uma validação humana para exibir as métricas aqui.</p>';
+}
+async function refreshDashboard(sessionId = "") {
+  dashboardData = await api(`/dashboard${sessionId?`?session_id=${encodeURIComponent(sessionId)}`:""}`);
+  renderDashboard();
+}
+action("refresh-dashboard", async()=>refreshDashboard($("dashboard-session").value));
+$("dashboard-session").addEventListener("change",()=>refreshDashboard($("dashboard-session").value).catch(error=>notice(error.message,true)));
+$("dashboard-sessions").addEventListener("click",event=>{const id=event.target.dataset.session;if(id)refreshDashboard(id).catch(error=>notice(error.message,true));});
 
 function renderSources() {
   const signature = JSON.stringify(state.nodes.map(n => [n.id,n.online,n.cameras]));
@@ -251,14 +299,29 @@ $("session-list").addEventListener("change", async () => {
     $("timeline").max = meta.duration; $("timeline").value = 0; lastFrameKey = "";
     $("csv-download").href = `/api/sessions/${meta.id}/predictions.csv`;
     $("session-events").innerHTML = selectedSession.events.map(e => `<p>${seconds(e.t)} s · ${esc(e.kind)} · ${esc(e.note)}</p>`).join("") || "Nenhum marco registrado.";
-    report = null; $("report-download").disabled = true; loadAnnotations();
+    report = null; agreementReport = null; consensusSources = null;
+    $("report-download").disabled = true; $("agreement-report").hidden = true;
+    $("prepare-consensus").disabled = true; refreshAnnotatorChoices(); loadAnnotations();
     $("review-content").hidden = false; renderFrame();
   } catch(error) { notice(error.message,true); }
 });
 function loadAnnotations() {
   loadedAnnotator = $("annotator").value.trim();
   annotations = structuredClone(selectedSession.annotations[loadedAnnotator] || []);
+  consensusSources = selectedSession.annotation_metadata?.[loadedAnnotator]?.sources || null;
   dirty = false; renderAnnotations();
+}
+function refreshAnnotatorChoices() {
+  const values=Object.keys(selectedSession?.annotations||{}).filter(name=>selectedSession.annotations[name]?.length&&selectedSession.annotation_metadata?.[name]?.kind!=="consensus");
+  for(const id of ["agreement-first","agreement-second"]){
+    const select=$(id), previous=select.value;
+    select.innerHTML='<option value="">Selecione</option>'+values.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");
+    if(values.includes(previous))select.value=previous;
+  }
+  if(values.length>=2){
+    if(!$("agreement-first").value)$("agreement-first").value=values[0];
+    if(!$("agreement-second").value)$("agreement-second").value=values.find(value=>value!==$("agreement-first").value)||"";
+  }
 }
 action("load-annotations", async () => {
   if (!selectedSession) throw new Error("Selecione uma sessão");
@@ -266,13 +329,19 @@ action("load-annotations", async () => {
   loadAnnotations();
 });
 function renderAnnotations() {
-  $("annotation-list").innerHTML = annotations.map((row,index) => `<div class="annotation-row"><span>${seconds(row.start)}–${seconds(row.end)} s</span><strong>${names[row.target]}</strong><button data-remove="${index}" aria-label="Remover intervalo ${index+1}">Remover</button></div>`).join("") || '<p class="small muted">Nenhum intervalo anotado.</p>';
+  $("annotation-list").innerHTML = annotations.map((row,index) => `<div class="annotation-row ${row.needs_review?'needs-review':''}"><span>${seconds(row.start)}–${seconds(row.end)} s</span><strong>${names[row.target]}</strong>${row.needs_review?'<em>Revisar divergência</em>':''}<button data-edit="${index}" class="secondary" aria-label="Editar intervalo ${index+1}">Editar</button><button data-remove="${index}" aria-label="Remover intervalo ${index+1}">Remover</button></div>`).join("") || '<p class="small muted">Nenhum intervalo anotado.</p>';
   $("annotation-status").textContent = `${loadedAnnotator || "Informe o avaliador"} · ${annotations.length} intervalos${dirty ? " · alterações não salvas" : ""}`;
   $("validation-report").hidden = true; report = null; $("report-download").disabled = true;
 }
 $("annotation-list").addEventListener("click", event => {
   const index = event.target.dataset.remove;
   if (index !== undefined) { annotations.splice(Number(index),1); dirty = true; renderAnnotations(); }
+  const editIndex = event.target.dataset.edit;
+  if (editIndex !== undefined) {
+    const row=annotations.splice(Number(editIndex),1)[0];
+    $("interval-start").value=seconds(row.start); $("interval-end").value=seconds(row.end);
+    $("interval-target").value=row.target; $("timeline").value=row.start; dirty=true; renderAnnotations(); renderFrame();
+  }
 });
 action("add-interval", async () => {
   if ($("annotator").value.trim() !== loadedAnnotator) throw new Error("Carregue as anotações desse avaliador antes de editar");
@@ -284,8 +353,15 @@ action("add-interval", async () => {
 async function saveAnnotations() {
   const annotator = $("annotator").value.trim();
   if (!annotator || annotator !== loadedAnnotator) throw new Error("Informe o avaliador e carregue suas anotações antes de salvar");
-  await post(`/sessions/${selectedSession.metadata.id}/annotations`,{annotator,intervals:annotations});
-  selectedSession.annotations[annotator] = structuredClone(annotations); dirty = false; renderAnnotations();
+  if(consensusSources&&annotations.some(row=>row.needs_review))throw new Error("Revise todos os intervalos divergentes antes de salvar o consenso");
+  const clean=annotations.map(({start,end,target})=>({start,end,target}));
+  if(consensusSources){
+    await post(`/sessions/${selectedSession.metadata.id}/consensus`,{annotator,first:consensusSources[0],second:consensusSources[1],intervals:clean});
+    selectedSession.annotation_metadata ||= {};
+    selectedSession.annotation_metadata[annotator]={kind:"consensus",sources:[...consensusSources]};
+  }else await post(`/sessions/${selectedSession.metadata.id}/annotations`,{annotator,intervals:clean});
+  selectedSession.annotations[annotator] = structuredClone(clean); annotations=structuredClone(clean);
+  dirty = false; refreshAnnotatorChoices(); renderAnnotations();
 }
 action("save-annotations",async () => { await saveAnnotations(); notice("Anotações salvas no servidor."); });
 action("evaluate",async () => {
@@ -297,6 +373,35 @@ function renderReport(value) {
   $("validation-report").hidden = false;
   $("validation-report").innerHTML = `<h2>Comparação com ${esc(value.annotator)}</h2><p class="small muted">Matriz ponderada pela duração em segundos. Abstenções contam no denominador da acurácia. Trechos humanos indeterminados são excluídos das métricas.</p><div class="metrics">${[["Acurácia",pct(value.accuracy)],["Cobertura automática",pct(value.coverage)],["Macro F1",pct(value.macro_f1)],["Kappa",value.kappa == null ? "—" : value.kappa.toFixed(3)]].map(([label,v])=>`<div class="metric"><strong>${v}</strong><span>${label}</span></div>`).join("")}</div><p>${seconds(value.annotated_seconds)} s anotados de ${seconds(value.session_seconds)} s (${pct(value.annotation_coverage)}). ${seconds(value.ambiguous_seconds)} s ambíguos. Acurácia apenas nos trechos com previsão: ${pct(value.selective_accuracy)}.</p><h3>Matriz de confusão · linhas = humano / colunas = sistema</h3><div class="table-scroll"><table><thead><tr><th>Segundos</th>${labels.map(l=>`<th>${names[l]}</th>`).join("")}</tr></thead><tbody>${labels.slice(0,4).map(t=>`<tr><th>${names[t]}</th>${labels.map(p=>`<td>${value.matrix[t][p].toFixed(2)}</td>`).join("")}</tr>`).join("")}</tbody></table></div><table><thead><tr><th>Alvo</th><th>Precisão</th><th>Revocação</th><th>F1</th><th>Suporte (s)</th></tr></thead><tbody>${Object.entries(value.per_target).map(([label,m])=>`<tr><td>${names[label]}</td><td>${pct(m.precision)}</td><td>${pct(m.recall)}</td><td>${pct(m.f1)}</td><td>${m.support.toFixed(2)}</td></tr>`).join("")}</tbody></table>`;
 }
+action("compare-annotators",async()=>{
+  if(!selectedSession)throw new Error("Selecione uma sessão");
+  const first=$("agreement-first").value,second=$("agreement-second").value;
+  if(!first||!second||first===second)throw new Error("Selecione dois avaliadores diferentes");
+  agreementReport=await api(`/sessions/${selectedSession.metadata.id}/agreement?first=${encodeURIComponent(first)}&second=${encodeURIComponent(second)}`);
+  renderAgreement(agreementReport); $("prepare-consensus").disabled=!agreementReport.consensus_draft.length;
+});
+function renderAgreement(value){
+  const disagreements=value.disagreements||[];
+  $("agreement-report").hidden=false;
+  $("agreement-report").innerHTML=`<div class="metrics">${[["Concordância",pct(value.agreement)],["Kappa",value.kappa==null?"—":Number(value.kappa).toFixed(3)],["Cobertura conjunta",pct(value.joint_coverage)],["Tempo comparável",`${seconds(value.comparable_seconds)} s`]].map(([label,v])=>`<div class="metric"><strong>${v}</strong><span>${label}</span></div>`).join("")}</div><p>${seconds(value.joint_seconds)} s cobertos pelos dois avaliadores; ${seconds(value.indeterminate_seconds)} s possuem ao menos uma marcação indeterminada.</p><h3>IoU temporal por alvo</h3><div class="agreement-iou">${Object.entries(value.per_target_iou).map(([target,iou])=>`<span><strong>${esc(names[target])}</strong> ${pct(iou)}</span>`).join("")}</div><h3>Divergências para revisão (${disagreements.length})</h3><div class="disagreement-list">${disagreements.map((row,index)=>`<button class="disagreement-row" data-disagreement="${index}"><span>${seconds(row.start)}–${seconds(row.end)} s</span><strong>${esc(names[row.first])} × ${esc(names[row.second])}</strong><small>abrir no vídeo</small></button>`).join("")||'<p class="small muted">Nenhuma divergência na cobertura comparável.</p>'}</div>`;
+}
+$("agreement-report").addEventListener("click",event=>{
+  const index=event.target.closest("[data-disagreement]")?.dataset.disagreement;
+  if(index===undefined)return;
+  const row=agreementReport.disagreements[Number(index)];
+  $("timeline").value=row.start; $("interval-start").value=seconds(row.start); $("interval-end").value=seconds(row.end);
+  stopPlayback(); renderFrame();
+});
+action("prepare-consensus",async()=>{
+  if(!agreementReport?.consensus_draft?.length)throw new Error("Calcule a concordância primeiro");
+  if(dirty&&!confirm("Descartar as alterações não salvas e preparar o consenso?"))return;
+  const safe=value=>value.replace(/[^a-zA-Z0-9_-]/g,"_");
+  const consensusName=`CONSENSO_${safe(agreementReport.first)}_${safe(agreementReport.second)}`.slice(0,80);
+  $("annotator").value=consensusName; loadedAnnotator=consensusName;
+  consensusSources=[agreementReport.first,agreementReport.second];
+  annotations=structuredClone(agreementReport.consensus_draft); dirty=true; renderAnnotations();
+  notice("Rascunho de consenso preparado. Use Editar nos intervalos destacados e salve somente após resolver cada divergência.");
+});
 action("report-download",async () => {
   if (!report) return;
   const url = URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:"application/json"}));

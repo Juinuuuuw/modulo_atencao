@@ -54,10 +54,10 @@ Sistema central para observar alvos visuais no ambiente com notebook, TV e robô
 
 ## Iniciar o servidor
 
-Use Python 3.10 de 64 bits (o MediaPipe 0.10.14 está fixado neste projeto). Execute `iniciar_servidor.bat` ou:
+Use Python 3.10 ou 3.11 de 64 bits (o MediaPipe 0.10.14 está fixado neste projeto). Execute `iniciar_servidor.bat` ou:
 
 ```powershell
-python -m venv .venv
+py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe server.py --open
 ```
@@ -131,9 +131,42 @@ Encerre pelo painel antes de sair. Os arquivos ficam em `sessions/ID_DA_SESSAO/`
 - `frames.jsonl`: tempo de cada quadro, chegada, incerteza e arquivo correspondente.
 - `notebook/`, `nao/`, `validation/`: sequência JPEG, com tempo real preservado no índice. A reprodução no painel usa esses tempos, sem preencher lacunas como se fossem vídeo válido.
 - `predictions.jsonl`: previsões aproximadamente a 5 Hz e resultados de cada câmera.
+- `attention_events.jsonl`: intervalos de estados observáveis, duração, câmeras de apoio e perda de rastreamento por câmera.
 - `events.jsonl`: marcos do experimento.
 - `annotations.json`: intervalos independentes por avaliador.
-- `report.json`: último relatório calculado. As anotações dos demais avaliadores continuam preservadas.
+- `annotation_metadata.json`: origem das anotações de consenso, sem alterar os avaliadores independentes.
+- `reports.json`: relatórios do sistema contra cada avaliador e contra os consensos preservados.
+- `report.json`: último relatório calculado, mantido para compatibilidade com versões anteriores.
+
+### Banco local e painel de análises
+
+O servidor cria automaticamente `sessions/observa.sqlite3`. Esse banco é um índice
+analítico reconstruível: na inicialização, sessões antigas em JSON/JSONL são importadas,
+e uma sessão é sincronizada ao iniciar e encerrar a gravação, salvar anotações ou calcular
+um relatório. Os arquivos JSON/JSONL continuam sendo o registro bruto e os JPEGs não são
+copiados para dentro do banco.
+
+A aba **Dados e análises** mostra totais do estudo, tempo estimado por alvo visual,
+estados temporais, perda de rastreamento por câmera, marcos e métricas de validação
+humana. O resumo de sessões pode ser exportado em CSV para uma planilha. A exportação
+detalhada inclui alvo, estado temporal, EAR, atividade do olhar, validade por câmera e
+`screen_gaze`.
+
+Os estados de foco distinguem notebook, apresentação e robô. `OUTRO_LOCAL` somente vira
+`DISPERSAO_EXTERNA` após 2 s contínuos; ao confirmar, o início do intervalo volta ao
+primeiro instante da sequência. A mesma regra de 2 s é usada para olhos fechados
+prolongadamente (`SLEEPY`). O limiar de EAR é o menor entre 0,25 e 60% da referência
+individual obtida na calibração. Os números são parâmetros explícitos e ficam registrados
+em `session.json`, para posterior revisão no piloto.
+
+A atividade espacial do olhar é calculada em janela móvel de 5 s a 3 Hz. Por padrão, ela
+é armazenada como variável contínua, mas não gera rótulo de distração: o limiar permanece
+desativado até ser estimado e validado com dados do estudo-piloto. Assim, o software não
+confunde pouca movimentação ocular com desatenção cognitiva.
+
+Não edite o SQLite durante uma coleta. Se o arquivo for removido com o servidor parado,
+ele será recriado a partir das pastas de sessão na próxima inicialização. Faça backup da
+pasta `sessions/` inteira, pois o banco não contém as imagens.
 
 O tamanho da gravação depende da resolução, taxa e duração; confira espaço livre antes da coleta. O padrão do cliente USB é até 1280×720 a 30 FPS (JPEG qualidade 90), igual ao módulo isolado; em rede lenta, reduza com `--width 960 --height 540 --fps 20`. Durante as calibrações o extrator processa todos os quadros (~30 Hz); fora delas, ~5 Hz. Na calibração de posição, amostras com EAR abaixo de 0,20 (piscadas, olhos semicerrados) são descartadas. O NAO usa VGA JPEG a até 15 FPS. O ritmo efetivo depende do hardware e da rede. Falhas de conexão ficam registradas como lacunas. Sessões abertas durante uma queda do servidor são marcadas como interrompidas na próxima inicialização. Não se retoma uma coleta automaticamente após reiniciar.
 
@@ -143,9 +176,22 @@ Em **Validação humana**, selecione uma sessão encerrada. A perspectiva inicia
 
 Identifique o avaliador, anote intervalos não sobrepostos e salve antes de calcular os resultados. Use `INDETERMINADO` quando a gravação não permitir classificar. O sistema não mostra a previsão automática sobre o vídeo de anotação. Para outro avaliador, informe seu identificador e clique em **Carregar anotações** antes de editar.
 
-O relatório compara previsão com anotação usando a duração de interseção em segundos, em vez de contar quadros com taxas diferentes. Inclui matriz de confusão, precisão, revocação, F1 por alvo, macro F1 dos alvos com suporte, acurácia e kappa. Predições indeterminadas contam como erros na acurácia. A cobertura informa quanto do tempo rotulado recebeu uma previsão determinada. A acurácia seletiva é mostrada separadamente. Trechos humanos indeterminados são excluídos das métricas e têm sua duração informada. Lacunas de previsão acima de 0,5 s viram indeterminadas; a última previsão não se estende indefinidamente. Não há pontuação perfeita quando faltam anotações.
+Depois que os dois avaliadores salvarem suas anotações independentes, selecione-os em
+**Concordância entre avaliadores**. O sistema calcula a concordância percentual e o kappa
+de Cohen ponderados pela duração, a cobertura conjunta, a matriz temporal e o IoU por
+alvo. Trechos em que ao menos um avaliador marcou `INDETERMINADO` são informados
+separadamente. A lista de divergências abre o vídeo diretamente no instante correspondente.
 
-Exporte as previsões CSV e o relatório JSON pelo painel. Para validação científica, use a verificação como diagnóstico do ajuste e a anotação humana de trechos independentes como avaliação; amostras próximas no tempo são correlacionadas. Esta versão calcula concordância sistema–avaliador, não concordância entre dois avaliadores.
+O botão **Preparar consenso** conserva automaticamente os intervalos concordantes e marca
+cada divergência para revisão. O consenso só pode ser salvo depois que todas essas marcações
+forem revisadas e se cobrir exatamente o período anotado pelos dois avaliadores. Ele é salvo
+como um terceiro conjunto, sem substituir ou modificar as anotações originais. Em seguida,
+use **Calcular validação** para comparar o sistema individualmente com cada avaliador e com
+o consenso.
+
+O relatório compara previsão com anotação usando a duração de interseção em segundos, em vez de contar quadros com taxas diferentes. Inclui matriz de confusão, precisão, revocação, F1 por alvo, macro F1 dos alvos com suporte, acurácia e kappa. Também calcula IoU temporal dos intervalos de foco/dispersão nos limiares 0,1, 0,3, 0,5 e 0,7. Predições indeterminadas contam como erros na acurácia. A cobertura informa quanto do tempo rotulado recebeu uma previsão determinada. A acurácia seletiva é mostrada separadamente. Trechos humanos indeterminados são excluídos das métricas e têm sua duração informada. Lacunas de previsão acima de 0,5 s viram indeterminadas; a última previsão não se estende indefinidamente. Não há pontuação perfeita quando faltam anotações.
+
+Exporte as previsões CSV e o relatório JSON pelo painel. Para validação científica, use a verificação como diagnóstico do ajuste e a anotação humana de trechos independentes como avaliação; amostras próximas no tempo são correlacionadas. Analise a concordância entre os avaliadores antes de interpretar o desempenho do sistema contra o consenso.
 
 ## Linhas dos olhos nas prévias
 

@@ -14,6 +14,7 @@ import uuid
 import cv2
 import numpy as np
 
+from .attention_timeline import AttentionConfig, AttentionTimeline
 from .target_classifier import TARGETS, UNKNOWN, ROLES, REGIONS, TargetClassifier, feature_status, screen_feature_status, fuse, region_votes
 from .validation import evaluate_checks
 from .calibration_protocol import PROFILES, calibration_plan
@@ -82,6 +83,10 @@ class Experiment:
         # Último acesso da aba "Olhar ao vivo"; acelera a análise enquanto aberta.
         self.live_viewer_seen = -1e9
         self.last_logged = -1e9
+        self.attention_config = AttentionConfig()
+        self.attention_tracker = None
+        self.attention_live = {"state": "INDETERMINADO", "since": None,
+                               "gaze_activity": None, "ear": None}
         # Atribuições lembradas por câmera física (computador/índice). Após reiniciar o
         # servidor, o conector volta a receber as mesmas câmeras sem fechá-las: reabrir
         # webcams no Windows às vezes trava o driver até reiniciar o conector.
@@ -440,6 +445,7 @@ class Experiment:
                                     and vector is not None and frame.uncertainty <= 0.15):
                                 self.samples.append({"role": role, "target": cal["plan"][cal["index"]]["target"],
                                                      "features": vector, "step": cal["index"], "pose": frame.pose,
+                                                     "ear": getattr(observation, "ear", None),
                                                      "capture": frame.capture, "sequence": frame.sequence,
                                                      "sync_uncertainty_s": frame.uncertainty,
                                                      "part": cal["plan"][cal["index"]].get("part")})
@@ -501,8 +507,14 @@ class Experiment:
                 pose = observation.get("pose")
                 if pose is None or max(abs(a - b) for a, b in zip(pose, self.pose_reference[role])) > 0.08:
                     reason = "cabeça do NAO mudou de pose; recalibre"
-            predictions[role] = ({"target": UNKNOWN, "score": 0, "reason": reason} if reason
-                                 else self.classifier.predict(role, observation["features"]))
+            tracking_valid = reason is None and observation is not None and observation.get("features") is not None
+            prediction = ({"target": UNKNOWN, "score": 0, "reason": reason} if reason
+                          else self.classifier.predict(role, observation["features"]))
+            prediction.update(tracking_valid=tracking_valid,
+                              ear=observation.get("ear") if observation else None,
+                              face_count=observation.get("face_count") if observation else 0,
+                              sync_uncertainty_s=observation.get("uncertainty") if observation else None)
+            predictions[role] = prediction
         self.predictions = predictions
         self.live = fuse(list(predictions.values()))
         cal = self.calibration
@@ -520,8 +532,32 @@ class Experiment:
                 position = self.screen_gaze.position(key, now, self.observations, labels, self.displays, require_view=False)
                 screens[key] = ([position["x"], position["y"]] + ([position["part"]] if "part" in position else [])
                                 if position["visible"] else None)
+            t = now - self.current["origin"]
+            tracking = {role: bool(value.get("tracking_valid")) for role, value in predictions.items()}
+            ears = [value["ear"] for value in predictions.values()
+                    if value.get("tracking_valid") and value.get("ear") is not None]
+            ear = float(np.median(ears)) if ears else None
+            supporting = [role for role, value in predictions.items()
+                          if value.get("tracking_valid") and value.get("target") == self.live["target"]]
+            gaze_point = self._attention_gaze_point(self.live["target"], screens)
+            closed, attention = self.attention_tracker.update(
+                t, self.live["target"], ear=ear, tracking=tracking,
+                supporting_cameras=supporting, gaze_point=gaze_point)
+            self.attention_live = attention
+            for event in closed:
+                append_json(self.current["path"] / "attention_events.jsonl", event)
             append_json(self.current["path"] / "predictions.jsonl", {
-                "t": now - self.current["origin"], **self.live, "cameras": predictions, "screen_gaze": screens})
+                "t": t, **self.live, "cameras": predictions, "screen_gaze": screens,
+                "attention": attention})
+
+    @staticmethod
+    def _attention_gaze_point(target, screens):
+        surface = {"NOTEBOOK": "notebook", "TV": "tv", "NAO": "robot"}.get(target)
+        if surface is None:
+            return None
+        points = [value[:2] for key, value in screens.items()
+                  if key.startswith(surface + ":") and value is not None]
+        return np.median(np.asarray(points, dtype=float), axis=0).tolist() if points else None
 
     def live_gaze(self, now=None, participant=None):
         """Para onde a pessoa olha, pelas calibrações de posição do participante escolhido.
@@ -662,11 +698,26 @@ class Experiment:
                     "calibration": self.samples, "models": self.classifier.models,
                     "pose_reference": self.pose_reference, "fit_report": self.fit_report,
                     "check_samples": self.checks, "check_report": self.check_report,
+                    "attention_method": {
+                        "config": self.attention_config.export(),
+                        "low_activity_label": "indicador observável; não infere distração cognitiva",
+                        "fusion": "todas as câmeras válidas; não há câmera ativa única"},
                     "pilot_override": override.strip(),
                     "timing": "captura aproximada após leitura, corrigida por RTT; não é sincronização de hardware"}
         write_json(path / "session.json", metadata)
         write_json(path / "annotations.json", {})
         self.current = {"id": session_id, "path": path, "origin": time.perf_counter(), "metadata": metadata}
+        ears = [float(row["ear"]) for row in self.samples
+                if row.get("ear") is not None and math.isfinite(float(row["ear"]))]
+        reference = float(np.median(ears)) if ears else None
+        self.attention_tracker = AttentionTimeline(self.attention_config, reference, ROLES)
+        metadata["attention_method"].update(ear_reference=reference,
+                                            ear_threshold=self.attention_tracker.ear_threshold)
+        write_json(path / "session.json", metadata)
+        self.attention_live = {"state": "INDETERMINADO", "since": 0,
+                               "gaze_activity": None, "ear": None,
+                               "ear_threshold": self.attention_tracker.ear_threshold}
+        self.last_logged = -1e9
         self.calibration = None
         return session_id
 
@@ -682,9 +733,14 @@ class Experiment:
         if not self.current:
             raise ValueError("Nenhuma gravação ativa")
         current = self.current
-        current["metadata"].update(duration=time.perf_counter() - current["origin"], status="complete")
+        duration = time.perf_counter() - current["origin"]
+        if self.attention_tracker:
+            for event in self.attention_tracker.close(duration):
+                append_json(current["path"] / "attention_events.jsonl", event)
+        current["metadata"].update(duration=duration, status="complete")
         write_json(current["path"] / "session.json", current["metadata"])
         self.current = None
+        self.attention_tracker = None
         return current["id"]
 
     def reading_status(self, role, now=None, spatial=False):
@@ -725,7 +781,8 @@ class Experiment:
                                    "prediction": self.predictions.get(role), "error": self.errors.get(role),
                                    "reading": self.reading_status(role, now)}
                             for role, source in self.assignments.items()},
-                "live": self.live, "error": self.last_error, "calibration": calibration,
+                "live": self.live, "attention": self.attention_live,
+                "error": self.last_error, "calibration": calibration,
                 "displays": self.display_status(now),
                 "screen_gaze": {"calibration": self.screen_gaze.cue(now),
                                 "participant": self.screen_gaze.participant,
