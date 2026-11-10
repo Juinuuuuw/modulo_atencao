@@ -7,10 +7,11 @@ import math
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from modules.multicamera import Experiment
+from modules.multicamera import Experiment, Frame
 from modules.screen_gaze import ScreenGaze, camera_opinion, fuse_surfaces, zone_log_probabilities
 
 SOURCES = {"notebook": "pc/0", "validation": "pc/1"}
@@ -103,6 +104,69 @@ class CrossZoneTests(unittest.TestCase):
         self.assertEqual(data["target"], "TV")
         self.assertFalse(estimates["notebook"]["inside"])
         self.assertTrue(estimates["tv"]["inside"])
+
+    def test_inaccurate_coordinates_do_not_cancel_recognized_screen(self):
+        for surface, role in (("tv", "validation"), ("notebook", "notebook")):
+            model = self.exp.screen_gaze.models_for("P013")[f"{surface}:{role}"]["map"]
+            for point, visible in (([1.3, .5], True), ([3., .5], False), (None, False)):
+                with self.subTest(surface=surface, point=point), patch.object(model, "predict", return_value=point):
+                    data, estimates = self.look(surface, .5, .5)
+                    own = estimates[surface]
+                    self.assertEqual(data["target"], surface.upper())
+                    self.assertTrue(own["inside"])
+                    self.assertFalse(own["position_inside"])
+                    self.assertEqual(own["visible"], visible)
+                    if not visible:
+                        self.assertNotIn("x", own)  # never invent a point at the center
+
+    def test_overlay_recognizes_point_calibration_without_target_classifier(self):
+        for surface in ("tv", "notebook"):
+            self.look(surface, .5, .5)
+            self.assertFalse(self.exp.classifier.models)
+            for role, obs in self.exp.observations.items():
+                # The eye reading accepted by point calibration can be rejected by
+                # the stricter general classifier, as when looking down at a screen.
+                obs.update(screen_features=obs["features"], features=None,
+                           eyes=[[.4, .4], [.6, .4]], direction=[.1, 0])
+                frame = Frame(None, b"", obs["capture"], obs["capture"], .01, 1)
+                overlay = self.exp.eye_overlay(role, frame, "P013")
+                self.assertTrue(overlay["calibrated"])
+                self.assertEqual(overlay["source"], "posição")
+                self.assertEqual(overlay["target"], surface.upper())
+                self.assertEqual(overlay["regions"]["screens"]["target"], "DENTRO")
+                self.assertNotIn("Calibre", overlay["reason"])
+
+    def test_overlay_does_not_color_stale_or_missing_eyes(self):
+        self.look("tv", .5, .5)
+        obs = self.exp.observations["validation"]
+        frame = Frame(None, b"", obs["capture"], obs["capture"], .01, 1)
+        obs["eyes"] = None
+        self.assertEqual(self.exp.eye_overlay("validation", frame, "P013")["target"], "INDETERMINADO")
+        obs.update(eyes=[[.4, .4], [.6, .4]], capture=obs["capture"] - 1)
+        overlay = self.exp.eye_overlay("validation", frame, "P013")
+        self.assertEqual(overlay["target"], "INDETERMINADO")
+        self.assertIsNone(overlay["eyes"])
+
+    def test_preview_endpoint_uses_the_selected_participant(self):
+        import json
+        from server import create_app
+
+        self.look("tv", .5, .5)
+        app = create_app(self.directory.name, "test-only", start_worker=False)
+        exp = app.extensions["experiment"]
+        exp.screen_gaze = self.exp.screen_gaze
+        exp.screen_gaze.participant = "another-participant"
+        exp.nodes, exp.assignments, exp.observations = self.exp.nodes, self.exp.assignments, self.exp.observations
+        obs = exp.observations["validation"]
+        obs.update(eyes=[[.4, .4], [.6, .4]], direction=[.1, 0])
+        exp.frames["n1:1"] = Frame(None, b"jpeg", obs["capture"], obs["capture"], .01, 1)
+        client = app.test_client()
+        client.post("/api/login", json={"key": "test-only"})
+        response = client.get("/api/preview/validation?participant=P013")
+        self.assertEqual(response.status_code, 200)
+        overlay = json.loads(response.headers["X-Eye-Overlay"])
+        self.assertEqual((overlay["participant"], overlay["target"]), ("P013", "TV"))
+        self.assertEqual(exp.screen_gaze.participant, "another-participant")
 
     def test_without_cross_zones_the_tv_camera_claims_the_notebook_gaze(self):
         """O defeito da foto: cada câmera só conhece a própria tela, e as duas acendem.

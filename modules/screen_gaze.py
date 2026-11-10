@@ -467,6 +467,7 @@ class ScreenGaze:
     def load(self):
         if not self.store or not self.store.exists():
             return
+        latest_saved = ""
         for path in sorted(self.store.glob("*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -474,6 +475,9 @@ class ScreenGaze:
                 for key, item in data["models"].items():
                     models[key] = {**item, "map": ScreenMap.from_data(item["map"])}
                 self.library[data["participant"]] = models
+                saved = data.get("saved_utc") or ""
+                if models and saved >= latest_saved:
+                    self.participant, latest_saved = data["participant"], saved
             except (OSError, ValueError, KeyError, TypeError):
                 continue
 
@@ -804,28 +808,32 @@ class ScreenGaze:
             return hidden("Piscada ou olhos semicerrados")
         obs = live_view(obs)
         zone = self.zone_decision(key, model, obs, participant, labels)
-        point = model["map"].predict(screen_vector(obs), geometry=obs)
-        if point is None:
-            # Leitura válida, mas muito longe desta superfície: conta como "fora dela".
-            far = model["map"].predict(screen_vector(obs), False, obs) is not None
-            return {**hidden("Olhar bem fora desta área calibrada" if far else "Leitura fora da postura calibrada"),
-                    "outside": far, **zone}
+        # Reconhecer a superfície e localizar o ponto são medidas distintas. Um mapa
+        # impreciso pode extrapolar para fora mesmo com o olhar na zona correta.
+        point = model["map"].predict(screen_vector(obs), False, obs)
+        visible = point is not None and all(abs(v - .5) <= 1.5 for v in point)
         validation = model["validation"] or {}
-        result = {"visible": True, "x": point[0], "y": point[1], "estimated": True,
+        result = {"visible": visible, "estimated": True,
                   "age": now - obs["capture"], "sequence": obs.get("sequence"), "role": model["role"],
                   "surface": model["surface"], "validation": validation, "level": validation.get("level"),
                   "verified": validation.get("accepted") is True,
                   "reason": "Posição aproximada; não confirma foco/atenção", **zone}
+        if visible:
+            result.update(x=point[0], y=point[1])
+        else:
+            result["reason"] = "Posição do olhar indisponível nesta área calibrada"
         if model["surface"] == "robot":
             accuracy = validation.get("part_accuracy")
             reliable = accuracy is None or accuracy >= ROBOT_PART_MIN_ACCURACY
             # Sem zona (mapa antigo), vale a regra anterior: perto de alguma parte.
             inside = zone["in_zone"] if zone["zone_ratio"] is not None else robot_part(point) is not None
-            part = robot_part(point) if inside and reliable else None
+            part = robot_part(point) if visible and inside and reliable else None
             result.update(part=part, part_label=ROBOT_PART_NAMES.get(part), inside=inside, part_reliable=reliable,
                           part_accuracy=accuracy)
         else:
-            result["inside"] = zone["in_zone"] and inside_screen(point, .15 if zone["zone_ratio"] is not None else SCREEN_MARGIN)
+            result["position_inside"] = inside_screen(point)
+            result["inside"] = zone["in_zone"] if zone["zone_ratio"] is not None else inside_screen(point)
+        result["outside"] = point is not None and not result["inside"]
         return result
 
     def zone_decision(self, key, model, observation, participant=None, labels=None):

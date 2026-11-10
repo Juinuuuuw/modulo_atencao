@@ -58,6 +58,16 @@ Escolha o **participante** no seletor. O padrão é o último calibrado. A aba m
 
 A aba não precisa da página de alvo aberta e pode ficar aberta enquanto a apresentação roda. Com ela aberta, o servidor analisa cerca de 15 quadros por segundo (em vez de 5). O registro da sessão continua a cerca de 5 Hz. Durante a gravação, `predictions.jsonl` também salva `screen_gaze`, com a estimativa de cada mapa (`superfície:câmera`; no robô, inclui a parte) ou `null`.
 
+**Indicação de olhar e posição do ponto.** Os cartões mostram **Olhando**, **Não olhando** ou **Indeterminado** pela decisão combinada das câmeras. Quando existe uma zona calibrada, o erro do mapa de coordenadas não cancela o reconhecimento da superfície: `inside` informa a opinião da zona, `position_inside` informa se a coordenada cabe na tela e `visible` informa se há um ponto utilizável. Se a tela é reconhecida sem coordenada utilizável, o cartão mostra “Olhando para a TV/notebook · Posição do olhar indisponível”; nenhum ponto central é inventado. A precisão da coordenada continua indicada separadamente. As linhas sobre os olhos também usam as calibrações por pontos do participante selecionado, mesmo sem o classificador de “Calibrar nesta disposição”. Ao reiniciar, o último participante salvo volta selecionado.
+
+Para reproduzir as leituras de validação salvas, sem câmeras nem alterações nos dados:
+
+```powershell
+.venv\Scripts\python.exe -m tools.replay_screen_gaze --participants P014 P016 P030
+```
+
+O replay reconstrói as zonas apenas com amostras de ajuste e usa leituras anteriores das outras câmeras da mesma fixação, com até 250 ms de diferença. Esses pontos de validação são correlacionados e não substituem uma avaliação ao vivo nem medem a detecção de “outro local”.
+
 Sistema central para observar alvos visuais no ambiente com notebook, TV e robô NAO. O servidor reúne três perspectivas faciais: a câmera do notebook, a câmera interna do NAO e uma webcam na tela de apresentação (TV). A aplicação de apresentação continua separada; seus marcos podem ser registrados no painel ou pela API.
 
 ## Iniciar o servidor

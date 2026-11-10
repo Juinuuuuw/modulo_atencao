@@ -353,7 +353,7 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
                 return "", 204
             jpeg = frame.jpeg
             sequence = frame.sequence
-            overlay = experiment.eye_overlay(role, frame)
+            overlay = experiment.eye_overlay(role, frame, participant_arg(request.args.get("participant")))
         response = send_file(io.BytesIO(jpeg), mimetype="image/jpeg")
         response.headers["X-Frame-Sequence"] = str(sequence)
         if overlay is not None:

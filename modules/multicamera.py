@@ -18,7 +18,7 @@ from .attention_timeline import AttentionConfig, AttentionTimeline
 from .target_classifier import TARGETS, UNKNOWN, ROLES, REGIONS, TargetClassifier, feature_status, screen_feature_status, fuse, region_votes
 from .validation import evaluate_checks
 from .calibration_protocol import PROFILES, calibration_plan
-from .screen_gaze import ScreenGaze, SURFACES, fuse_surfaces
+from .screen_gaze import ScreenGaze, SURFACES, fuse_surfaces, screen_vector
 from .temporal_filter import FeatureSmoother, StableTarget
 
 
@@ -598,7 +598,7 @@ class Experiment:
                                      require_view=False, participant=participant)
             surfaces[surface]["calibrated"] = True
             surfaces[surface]["estimates"].append({**gaze.summary(key, participant), "gaze": position})
-            if position["visible"] or position.get("outside"):
+            if position.get("zone_ratios") or position["visible"] or position.get("outside"):
                 ratios = dict(position.get("zone_ratios") or {})
                 if ratios.get(surface) is None:
                     # Mapa salvo antes das zonas: dentro/fora pelo próprio mapa.
@@ -649,31 +649,35 @@ class Experiment:
                 "cameras": {role: bool(self.frames.get(source) and now - self.frames[source].capture < 0.7)
                             for role, source in self.assignments.items() if source}}
 
-    def eye_overlay(self, role, frame):
+    def eye_overlay(self, role, frame, participant=None):
         """Metadados leves para desenhar no navegador, preservando os JPEG originais."""
         observation = self.observations.get(role)
         camera = self.predictions.get(role, {})
         fresh = bool(observation and time.perf_counter() - observation["capture"] <= 0.35
                      and abs(frame.capture - observation["capture"]) <= 0.30)
         geometry = observation if fresh else {}
-        valid = fresh and observation["features"] is not None
-        calibrated = role in self.classifier.models
-        target = self.live["target"]
-        reason = self.live["reason"]
+        participant = participant or self.screen_gaze.participant or self.calibration_participant
+        models = self.screen_gaze.models_for(participant)
+        spatial = bool(models)
+        decision = self.live_gaze(participant=participant) if spatial else self.live
+        valid = fresh and (screen_vector(observation) if spatial else observation.get("features")) is not None
+        calibrated = (any(m["role"] == role for m in models.values()) if spatial else role in self.classifier.models)
+        target = decision["target"]
+        reason = decision["reason"]
         if not fresh:
             reason = "Aguardando leitura dos olhos"
         elif not valid:
-            reason = observation.get("quality_reason") or "Leitura dos olhos insuficiente"
+            reason = (observation.get("screen_quality_reason") if spatial else observation.get("quality_reason")) or "Leitura dos olhos insuficiente"
         elif not calibrated:
             reason = "Calibre esta câmera"
-        elif camera.get("target", UNKNOWN) == UNKNOWN:
+        elif not spatial and camera.get("target", UNKNOWN) == UNKNOWN:
             reason = "Leitura desta câmera incerta"
         visible_eyes = fresh and bool(geometry.get("eyes"))
-        calibrated_fusion = bool(self.classifier.models)
+        calibrated_fusion = spatial or bool(self.classifier.models)
         certain = bool(visible_eyes and calibrated_fusion and target != UNKNOWN)
         regions = {}
         for key in REGIONS:
-            group = region_votes(self.live)[key]
+            group = region_votes(decision)[key]
             # A cor é o resultado da fusão para a mesma pessoa; uma câmera
             # auxiliar não precisa, sozinha, distinguir todos os alvos.
             group_certain = visible_eyes and calibrated_fusion and group["target"] != UNKNOWN
@@ -683,6 +687,7 @@ class Experiment:
                 "target": target if certain else UNKNOWN, "reason": reason,
                 "regions": regions,
                 "color_basis": "fused",
+                "participant": participant, "source": "posição" if spatial else "classificador",
                 "calibrated": calibrated, "fresh": fresh,
                 "observation_sequence": geometry.get("sequence"), "kind": "illustrative_2d"}
 

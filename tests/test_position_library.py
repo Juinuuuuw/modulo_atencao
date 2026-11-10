@@ -65,6 +65,15 @@ class RobotCalibrationTests(unittest.TestCase):
 
 
 class LibraryTests(unittest.TestCase):
+    def test_restart_selects_the_most_recent_participant_not_alphabetical_order(self):
+        with tempfile.TemporaryDirectory() as store:
+            gaze = ScreenGaze(store)
+            calibrate(gaze, participant="P900")
+            calibrate(gaze, participant="P001", start_at=500)
+            restored = ScreenGaze(store)
+            self.assertEqual(restored.participant, "P001")
+            self.assertTrue(restored.models)
+
     def test_each_camera_keeps_its_own_map_on_the_same_screen(self):
         gaze = ScreenGaze()
         calibrate(gaze, role="notebook", source="pc/0")

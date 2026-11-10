@@ -18,7 +18,8 @@ function paintRay(role){
   const enabled=$("show-eye-rays").checked;
   canvas.hidden=!enabled;badge.hidden=!enabled;
   const cached=rayFrames[role];
-  const recent=cached&&cached.source===state?.assignments[role]&&performance.now()-cached.receivedAt<=400&&state?.cameras[role]?.online;
+  const selected=activeTab==="live"?$("lg-participant-select").value:"";
+  const recent=cached&&(!selected||cached.metadata?.participant===selected)&&cached.source===state?.assignments[role]&&performance.now()-cached.receivedAt<=400&&state?.cameras[role]?.online;
   const metadata=recent?cached.metadata:{target:"INDETERMINADO",reason:"Aguardando leitura dos olhos",eyes:null,direction:null};
   const result=GazeOverlay.paint(canvas,image,metadata,$("ray-reference").value,enabled);
   badge.className=`ray-status ${result.state}`;
@@ -166,8 +167,11 @@ function renderState() {
     $(`status-${role}`).className = `badge ${camera.online ? "online" : ""}`;
     $(`source-${role}`).disabled = recording;
     const prediction = camera.prediction;
+    const targetDetail = activeTab === "live" && liveData?.source === "posição"
+      ? `Alvo combinado: ${names[liveTarget(liveData)]} · `
+      : prediction ? `${names[prediction.target]} · ${prediction.reason} · ` : "Sem modelo de alvos · ";
     $(`detail-${role}`).textContent = camera.error || (camera.online
-      ? `${prediction ? `${names[prediction.target]} · ${prediction.reason} · ` : "Sem modelo de alvos · "}envio ${camera.transport_ms ?? "—"} ms · sincronia ±${camera.sync_ms} ms (estimada)`
+      ? `${targetDetail}envio ${camera.transport_ms ?? "—"} ms · sincronia ±${camera.sync_ms} ms (estimada)`
       : "Conecte o cliente e aplique a câmera selecionada");
     if (!camera.online) { $(`preview-${role}`).hidden = true; paintRay(role); }
   }
@@ -230,9 +234,11 @@ async function refreshPreviews() {
     previewInFlight.add(role);
     const source = state.assignments[role];
     const previous = previewSequences[role];
-    const after = previous?.source === source ? `?after=${previous.sequence}` : "";
+    const query = new URLSearchParams();
+    if (previous?.source === source) query.set("after", previous.sequence);
+    if (activeTab === "live" && $("lg-participant-select").value) query.set("participant", $("lg-participant-select").value);
     try {
-      const response = await fetch(`/api/preview/${role}${after}`, {signal:AbortSignal.timeout(1500)});
+      const response = await fetch(`/api/preview/${role}?${query}`, {signal:AbortSignal.timeout(1500)});
       if (!response.ok || response.status === 204) return;
       const blob = await response.blob(), image = $(`preview-${role}`), oldUrl = image.dataset.blob;
       const nextUrl = URL.createObjectURL(blob);
@@ -478,7 +484,7 @@ function drawScreen(display, screen, highlighted) {
     ctx.fillText("Nenhuma câmera calibrada nesta tela", w / 2, h / 2); return;
   }
   const now = performance.now(), clamp = v => Math.max(0, Math.min(1, v));
-  let offscreen = false;
+  let offscreen = false, located = false;
   for (const estimate of screen.estimates) {
     const key = `${display}:${estimate.role}`, color = cameraColors[estimate.role];
     const trail = (liveTrails[key] || []).filter(p => now - p.t <= 2000);
@@ -491,11 +497,12 @@ function drawScreen(display, screen, highlighted) {
     const point = estimate.gaze?.visible ? smoothed(key) : null;
     if (!point) continue;
     const x = clamp(point.x) * w, y = clamp(point.y) * h;
-    if (estimate.gaze.inside === false) {
+    if (estimate.gaze.inside === false || !highlighted) {
       // A zona diz que o olhar está em outra superfície: só uma marca apagada, sem anel.
       ctx.fillStyle = `rgba(${color},.35)`; ctx.beginPath(); ctx.arc(x, y, 4 * ratio, 0, Math.PI * 2); ctx.fill();
       continue;
     }
+    located = true;
     ctx.strokeStyle = `rgb(${color})`; ctx.lineWidth = 2.5 * ratio;
     ctx.beginPath(); ctx.arc(x, y, 14 * ratio, 0, Math.PI * 2); ctx.stroke();
     ctx.fillStyle = `rgb(${color})`; ctx.beginPath(); ctx.arc(x, y, 4 * ratio, 0, Math.PI * 2); ctx.fill();
@@ -503,7 +510,13 @@ function drawScreen(display, screen, highlighted) {
   }
   if (offscreen) {
     ctx.fillStyle = "#ffd28f"; ctx.font = `${12 * ratio}px Segoe UI, sans-serif`; ctx.textAlign = "left";
-    ctx.fillText("estimativa fora da tela (mostrada na borda)", 10 * ratio, 18 * ratio);
+    ctx.fillText("posição imprecisa (mostrada na borda)", 10 * ratio, 18 * ratio);
+  }
+  if (highlighted && !located) {
+    ctx.fillStyle = "#b9f7d8"; ctx.font = `${14 * ratio}px Segoe UI, sans-serif`; ctx.textAlign = "center";
+    ctx.fillText(display === "tv" ? "Olhando para a TV" : "Olhando para o notebook", w / 2, h / 2);
+    ctx.font = `${12 * ratio}px Segoe UI, sans-serif`;
+    ctx.fillText("Posição do olhar indisponível", w / 2, h / 2 + 22 * ratio);
   }
 }
 function estimateLine(estimate) {
@@ -514,10 +527,10 @@ function estimateLine(estimate) {
   // Duas superfícies na mesma direção para esta câmera (ex.: robô na frente da TV): ela não
   // separa as duas sozinha; a decisão de cima usa as outras câmeras.
   const also = gaze.ambiguous_with ? ` · também compatível com ${surfaceLabel[gaze.ambiguous_with]}` : "";
-  const where = !gaze.visible ? esc(gaze.reason)
+  const where = !gaze.visible ? `${gaze.inside ? "superfície reconhecida · " : ""}${esc(gaze.reason)}`
     : gaze.surface === "robot" ? (!gaze.inside ? `fora do robô${closer}` : (gaze.part ? `olhando: ${esc(partShort[gaze.part])}`
       : gaze.part_reliable === false ? `olhando o robô · parte não confiável (${Math.round(6 * gaze.part_accuracy)}/6 na validação)` : "olhando o robô") + also)
-    : gaze.inside ? `x ${(gaze.x * 100).toFixed(0)}% · y ${(gaze.y * 100).toFixed(0)}%${also}` : `fora desta tela${closer}`;
+    : gaze.inside ? `olhando para esta tela · ${gaze.position_inside === false ? "posição imprecisa (fora do mapa)" : `x ${(gaze.x * 100).toFixed(0)}% · y ${(gaze.y * 100).toFixed(0)}%`}${also}` : `esta câmera não confirma esta tela${closer}`;
   return `<span class="cam-line"><span class="cam-dot" style="background:rgb(${cameraColors[estimate.role]})"></span>${esc(cameraNames[estimate.role])}: ${where} <span class="muted">· ${esc(quality)}</span></span>`;
 }
 function renderRobot(robot) {
@@ -560,9 +573,8 @@ function renderLive() {
   for (const display of ["notebook", "tv"]) {
     const screen = data.screens[display], highlighted = fused === (display === "tv" ? "TV" : "NOTEBOOK");
     $(`lg-card-${display}`).classList.toggle("looking", highlighted);
-    const levels = screen.estimates.map(e => e.validation?.level).filter(Boolean);
-    $(`lg-badge-${display}`).textContent = !screen.calibrated ? "Sem calibração" : `${screen.estimates.length} câmera(s)`;
-    $(`lg-badge-${display}`).className = `badge ${!screen.calibrated ? "" : levels.includes("alta") || levels.includes("moderada") ? "online" : "warn"}`;
+    $(`lg-badge-${display}`).textContent = screenBadge(screen, fused, display);
+    $(`lg-badge-${display}`).className = `badge ${highlighted ? "online" : fused === "INDETERMINADO" ? "warn" : ""}`;
     $(`lg-status-${display}`).innerHTML = !screen.calibrated
       ? `Calibre esta tela em <a href="/alvo?display=${display}" target="_blank" rel="noopener">/alvo?display=${display}</a>, uma câmera de cada vez.`
       : screen.estimates.map(estimateLine).join("");
@@ -571,12 +583,20 @@ function renderLive() {
   renderRobot({...data.robot, looking: fused === "NAO", part});
 }
 function liveTarget(data) { return data.stable?.target ?? data.target; }
+function screenBadge(screen, target, display) {
+  if (!screen.calibrated) return "Sem calibração";
+  if (target === (display === "tv" ? "TV" : "NOTEBOOK")) return "Olhando";
+  if (target === "INDETERMINADO") return "Indeterminado";
+  return "Não olhando";
+}
 async function pollLive() {
   if (!authenticated || activeTab !== "live" || document.hidden || liveBusy) return;
   liveBusy = true;
   try {
     const chosen = $("lg-participant-select").value;
-    liveData = await api(`/gaze/live${chosen ? `?participant=${encodeURIComponent(chosen)}` : ""}`);
+    const response = await api(`/gaze/live${chosen ? `?participant=${encodeURIComponent(chosen)}` : ""}`);
+    if (chosen !== $("lg-participant-select").value) return;
+    liveData = response;
     const now = performance.now();
     const estimates = [...liveData.screens.notebook.estimates.map(e => ["notebook", e]), ...liveData.screens.tv.estimates.map(e => ["tv", e]),
                        ...liveData.robot.estimates.map(e => ["robot", e])];
