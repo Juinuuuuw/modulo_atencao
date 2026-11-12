@@ -103,7 +103,9 @@ function renderDashboard() {
   $("dashboard-session-info").textContent = selected ? `${selected.participant} · ${clock(selected.duration||0)} · ${Number(selected.predictions).toLocaleString("pt-BR")} previsões · ${Number(selected.frames).toLocaleString("pt-BR")} quadros` : "Finalize uma gravação para visualizar as análises.";
   if (!selected) return;
   const duration = Math.max(.001, Number(selected.duration||0));
-  $("target-distribution").innerHTML = labels.map(target=>{
+  // A tarefa é o conjunto das três superfícies: notebook + TV + robô.
+  const taskSeconds = ["NOTEBOOK","TV","NAO"].reduce((sum,target)=>sum+Number(selected.target_seconds[target]||0),0);
+  $("target-distribution").innerHTML = `<div class="distribution-row"><div><strong>Na tarefa · notebook + TV + robô</strong><span>${seconds(taskSeconds)} s · ${pct(taskSeconds/duration)}</span></div><progress class="analysis-progress" max="${duration}" value="${taskSeconds}">${pct(taskSeconds/duration)}</progress></div>` + labels.map(target=>{
     const value=Number(selected.target_seconds[target]||0);
     return `<div class="distribution-row"><div><span class="chart-dot target-${target}"></span><strong>${names[target]}</strong><span>${seconds(value)} s · ${pct(value/duration)}</span></div><progress class="analysis-progress target-${target}" max="${duration}" value="${value}">${pct(value/duration)}</progress></div>`;
   }).join("");
@@ -143,6 +145,7 @@ function renderSources() {
 }
 function renderState() {
   if (state.error) notice(state.error, true);
+  renderNotifications();
   renderSources();
   const recording = !!state.recording;
   if(!participantInitialized){if(!$("participant").value&&state.calibration_participant)$("participant").value=state.calibration_participant;participantInitialized=true;}
@@ -159,7 +162,7 @@ function renderState() {
   }
   $("start-scene").disabled=recording||!!cal?.started;
   $("start-scene").textContent=cal?.profile==='assisted'&&!cal.complete?'Continuar calibração':'Calibrar nesta disposição';
-  $("server-status").textContent = recording ? "● Gravando" : "● Servidor conectado";
+  $("server-status").textContent = recording ? (state.recording.paused ? "Estudo pausado" : "● Gravando") : "● Servidor conectado";
   $("server-status").className = `badge ${recording ? "recording" : "online"}`;
   for (const role of roles) {
     const camera = state.cameras[role];
@@ -179,7 +182,10 @@ function renderState() {
   $("live-target").textContent = names[state.live.target] || state.live.target;
   $("live-task").textContent=task?.target==='DENTRO'?'Tarefa: dentro (notebook / TV / NAO)':task?.target==='FORA'?'Tarefa: fora':'Tarefa: indeterminado';
   $("live-reason").textContent = `${state.live.reason} · escore ${Number(state.live.score).toFixed(2)} (não é probabilidade)`;
-  $("start-recording").disabled = recording || !state.check_report?.sufficient;
+  // O servidor confere a calibração do participante (posição salva ou classificador verificado).
+  $("start-recording").disabled = recording;
+  $("pause-recording").disabled = !recording;
+  $("pause-recording").textContent = state.recording?.paused ? "Retomar" : "Pausar";
   $("stop-recording").disabled = !recording;
   $("recording-time").textContent = recording ? clock(state.recording.elapsed) : "00:00";
   $("participant").disabled = recording;
@@ -197,6 +203,7 @@ function renderState() {
   $("display-readiness").textContent=[['notebook','Notebook'],['tv','TV']].map(([key,label])=>`${label}: ${state.displays?.[key]?.online?'janela visível':'abra e ative a tela do ponto'}`).join(' · ');
   document.querySelectorAll("[data-event]").forEach(b => { b.disabled = !recording; });
   renderCalibration();
+  renderStudy();
   $("node-list").innerHTML = state.nodes.length ? state.nodes.map(node =>
     `<div class="node-row"><div><strong>${esc(node.name)}</strong><p>${node.cameras.map(c => esc(c.name)).join(" · ")}${node.error ? `<br>${esc(node.error)}` : ""}</p></div><span class="badge ${node.online ? "online" : ""}">${node.online ? "Conectado" : "Offline"}</span></div>`).join("") : "Nenhum cliente conectado.";
 }
@@ -225,7 +232,7 @@ function renderCalibration() {
     $("calibration-counts").textContent="";$("cal-progress").value=0;
   }
   const fit = state.fit_report, check = state.check_report;
-  $("check-summary").innerHTML = (fit ? `<p><strong>Câmeras calibradas:</strong> ${fit.usable_cameras.map(esc).join(", ")}. ${fit.warnings.map(esc).join(". ")}</p>` : "") + (check ? `<p><strong>Verificação independente:</strong> alvo exato ${pct(check.accuracy)} · cobertura ${pct(check.coverage)} · macro F1 ${pct(check.macro_f1)}.</p><p>${check.task_metrics?`Tarefa × fora: acurácia ${pct(check.task_metrics.accuracy)} · cobertura ${pct(check.task_metrics.coverage)}. `:""}${check.sufficient ? "Todos os alvos têm pelo menos 5 avaliações." : "Faltam avaliações de algum alvo; repita as etapas."} Limite de 65% é operacional para o piloto, não validação científica.</p>` : "");
+  $("check-summary").innerHTML = (fit ? `<p><strong>Câmeras calibradas:</strong> ${fit.usable_cameras.map(esc).join(", ")}. ${fit.warnings.map(esc).join(". ")}</p>` : "") + (check ? `<p><strong>Verificação independente:</strong> alvo exato ${pct(check.accuracy)} · cobertura ${pct(check.coverage)} · macro F1 ${pct(check.macro_f1)}.</p><p>${check.task_metrics?`Tarefa × fora: acurácia ${pct(check.task_metrics.accuracy)} · cobertura ${pct(check.task_metrics.coverage)}. `:""}${check.sufficient ? "Todos os alvos têm pelo menos 5 avaliações." : "Faltam avaliações de algum alvo; repita as etapas."} A precisão fica registrada na sessão e não impede a gravação.</p>` : "");
 }
 async function poll() { state = await api("/state"); renderState(); }
 async function refreshPreviews() {
@@ -279,8 +286,15 @@ action("begin-check", async () => { await post("/calibration",{action:"check",pr
 action("capture-step", async () => { await post("/calibration",{action:"capture"}); await poll(); });
 action("retry-capture", async () => { await post("/calibration",{action:"capture",index:Number($("retry-step").value)}); await poll(); });
 action("finish-calibration", async () => { await post("/calibration",{action:"finish"}); await poll(); });
-action("start-recording", async () => { await post("/recording/start",{participant:$("participant").value,override:$("override").value}); notice("Gravação iniciada. As três câmeras e previsões estão sendo salvas no servidor."); await poll(); });
+action("start-recording", async () => { await post("/recording/start",{participant:$("participant").value}); notice("Gravação iniciada. As três câmeras e previsões estão sendo salvas no servidor."); await poll(); });
 action("stop-recording", async () => { await post("/recording/stop"); notice("Sessão encerrada. Abra Validação humana para revisar."); await poll(); });
+async function togglePause() {
+  const paused = !state.recording?.paused;
+  await post("/recording/pause", {paused});
+  notice(paused ? "Estudo pausado: nada é gravado e o tempo do estudo para até retomar." : "Estudo retomado. O tempo continua de onde parou.");
+  await poll();
+}
+action("pause-recording", togglePause);
 document.querySelectorAll("[data-event]").forEach(button => button.addEventListener("click", async () => {
   try { await post("/events",{kind:button.dataset.event,note:$("event-note").value}); notice(`Marco ${button.textContent} registrado.`); $("event-note").value=""; }
   catch (error) { notice(error.message,true); }
@@ -295,7 +309,7 @@ async function refreshSessions() {
 action("refresh-sessions",refreshSessions);
 $("session-list").addEventListener("change", async () => {
   if (dirty && !confirm("Há anotações não salvas. Trocar de sessão e descartá-las?")) { $("session-list").value = selectedSession?.metadata.id || ""; return; }
-  stopPlayback(); $("validation-report").hidden = true; $("review-content").hidden = true;
+  stopPlayback(); $("validation-report").hidden = true; $("review-content").hidden = true; $("images-download").hidden = true;
   if (!$("session-list").value) return;
   try {
     selectedSession = await api(`/sessions/${$("session-list").value}`);
@@ -304,6 +318,9 @@ $("session-list").addEventListener("change", async () => {
     $("session-info").textContent = `${meta.participant} · ${seconds(meta.duration)} s · ${selectedSession.frames.length} quadros. ${meta.status === "interrupted" ? "Sessão interrompida: confira as lacunas." : ""}`;
     $("timeline").max = meta.duration; $("timeline").value = 0; lastFrameKey = "";
     $("csv-download").href = `/api/sessions/${meta.id}/predictions.csv`;
+    $("images-download").href = `/api/export/sessions/${meta.id}/images.zip`;
+    $("images-download").textContent = `Baixar imagens de ${meta.participant} (3 câmeras)`;
+    $("images-download").hidden = false;
     $("session-events").innerHTML = selectedSession.events.map(e => `<p>${seconds(e.t)} s · ${esc(e.kind)} · ${esc(e.note)}</p>`).join("") || "Nenhum marco registrado.";
     report = null; agreementReport = null; consensusSources = null;
     $("report-download").disabled = true; $("agreement-report").hidden = true;
@@ -559,8 +576,12 @@ function renderLive() {
   $("lg-reason").textContent = data.source === "posição" ? `${data.reason}${pending} · pelas calibrações de posição de ${data.participant}`
     : data.source === "classificador" ? `${data.reason} · pelo classificador de alvos (sem calibração de posição)`
     : "Nenhuma calibração para este participante. Calibre cada câmera na página de alvo (/alvo).";
-  $("lg-recording").textContent = data.recording ? "● Gravando" : "Sem gravação";
-  $("lg-recording").className = `badge ${data.recording ? "recording" : ""}`;
+  // No estudo, notebook, TV e robô juntos são o alvo da tarefa.
+  const onTask = fused === "INDETERMINADO" ? null : taskTargets.includes(fused);
+  $("lg-task").textContent = onTask === null ? "Tarefa: indeterminado" : onTask ? "Na tarefa · notebook, TV ou robô" : "Fora da tarefa";
+  $("lg-task").className = `task-chip ${onTask === null ? "" : onTask ? "in" : "out"}`;
+  $("lg-banner").classList.toggle("on-task", onTask === true);
+  $("lg-banner").classList.toggle("off-task", onTask === false);
   const select = $("lg-participant-select"), signature = data.participants.join("|");
   if (select.dataset.signature !== signature) {
     const chosen = select.value;
@@ -581,7 +602,125 @@ function renderLive() {
     drawScreen(display, screen, highlighted);
   }
   renderRobot({...data.robot, looking: fused === "NAO", part});
+  renderStudy();
 }
+// ---- Estudo pela aba ao vivo: participante calibrado, iniciar, pausar e finalizar ----
+const taskTargets = ["NOTEBOOK", "TV", "NAO"];
+function studyParticipant() { return $("lg-participant-select").value || liveData?.participant || ""; }
+function studyReadiness(data) {
+  if (!data) return {ok:false, text:"Aguardando a leitura do participante…"};
+  if (data.source === "posição") {
+    const items = [["notebook", data.screens.notebook], ["TV", data.screens.tv], ["robô NAO", data.robot]];
+    const missing = items.filter(([, item]) => !item.calibrated).map(([name]) => name);
+    // Um mapa só vale com a mesma câmera física de quando foi calibrado.
+    const stale = items.filter(([, item]) => item.calibrated && item.usable === false).map(([name]) => name);
+    if (missing.length) return {ok:false, text:`Falta calibrar ${missing.join(" e ")} para ${data.participant}.`};
+    if (stale.length) return {ok:false, text:`${data.participant}: ${stale.join(" e ")} calibrado(s) com outras câmeras. Recalibre com as câmeras atuais na página de alvo.`};
+    return {ok:true, text:`${data.participant}: notebook, TV e robô calibrados com as câmeras atuais. As três superfícies contam como tarefa.`};
+  }
+  if (data.source === "classificador" && state?.calibration_participant === data.participant)
+    return state.check_report?.sufficient ? {ok:true, text:`${data.participant}: sem calibração de posição; usa o classificador de alvos.`}
+      : {ok:false, text:"Conclua a verificação dos alvos em Câmeras e sessão."};
+  return {ok:false, text:"Este participante ainda não tem calibração."};
+}
+function renderStudy() {
+  if (!state) return;
+  const rec = state.recording, select = $("lg-participant-select");
+  if (rec && select.value !== rec.participant && [...select.options].some(option => option.value === rec.participant)) {
+    // Durante o estudo a aba mostra quem está sendo gravado.
+    select.value = rec.participant; resetLiveTrails(); liveData = null;
+  }
+  select.disabled = !!rec;
+  const ready = studyReadiness(liveData);
+  $("lg-start").disabled = !!rec || !ready.ok;
+  $("lg-pause").disabled = !rec;
+  $("lg-pause").textContent = rec?.paused ? "Retomar" : "Pausar";
+  $("lg-stop").disabled = !rec;
+  $("lg-timer").textContent = rec ? clock(rec.elapsed) : "00:00";
+  $("lg-recording").textContent = rec ? (rec.paused ? "Pausado" : "● Gravando") : "Sem gravação";
+  $("lg-recording").className = `badge ${rec ? (rec.paused ? "paused" : "recording") : ""}`;
+  $("lg-surfaces").textContent = rec
+    ? `Estudo de ${rec.participant} · ${rec.source === "posição" ? "calibração de posição (notebook, TV e robô)" : "classificador de alvos"}${rec.paused ? " · pausado, nada é gravado" : ""}`
+    : ready.text;
+}
+action("lg-start", async () => {
+  const participant = studyParticipant();
+  if (!participant) throw new Error("Escolha um participante calibrado");
+  await post("/recording/start", {participant});
+  notice(`Estudo de ${participant} iniciado. Notebook, TV e robô contam como tarefa. Pause ou finalize por aqui.`);
+  await poll();
+});
+action("lg-pause", togglePause);
+action("lg-stop", async () => {
+  const participant = state.recording?.participant || "este participante";
+  if (!confirm(`Finalizar o estudo de ${participant}? A sessão é salva e não pode ser retomada depois.`)) return;
+  await post("/recording/stop");
+  notice(`Estudo de ${participant} finalizado e salvo. Veja em Dados e análises ou Validação humana.`);
+  await poll();
+});
+// ---- Aviso do Klara: "Usuário iniciou a história" → pop-up para iniciar o estudo ----
+// Ao abrir o painel, avisos com mais de 2 min já contam como vistos. A chave usa o horário do
+// aviso, para um servidor reiniciado (ids recomeçando do 1) não esconder avisos novos.
+let seenNotifications = null, popupItem = null;
+const pageTitle = document.title;
+const notificationKey = item => `${item.utc}|${item.id}`;
+function renderNotifications() {
+  const items = state.notifications || [];
+  if (!seenNotifications) seenNotifications = new Set(items.filter(item => item.age > 120).map(notificationKey));
+  const fresh = items.filter(item => !seenNotifications.has(notificationKey(item)));
+  fresh.forEach(item => seenNotifications.add(notificationKey(item)));
+  if (fresh.length) showStoryPopup(fresh.at(-1));
+  // Alguém iniciou o estudo por outro caminho: o convite para iniciar perdeu o sentido.
+  else if (popupItem?.mode === "start" && state.recording) closeStoryPopup();
+}
+function storyJourney(item) { return item.details?.jornada ? ` · ${item.details.jornada}` : ""; }
+function showStoryPopup(item) {
+  const rec = state.recording, when = new Date(item.utc);
+  const hour = Number.isNaN(when.getTime()) ? "agora" : `às ${when.toLocaleTimeString("pt-BR")}`;
+  popupItem = {...item, mode: rec ? "info" : "start", shownAt: performance.now()};
+  $("story-popup-source").textContent = item.kind === "historia_iniciada" ? "AVISO DO KLARA" : "AVISO";
+  $("story-popup-title").textContent = item.message;
+  $("story-popup-error").hidden = true;
+  $("story-popup-pick").hidden = $("story-popup-start").hidden = !!rec;
+  $("story-popup-close").textContent = rec ? "OK" : "Agora não";
+  if (rec) {
+    $("story-popup-text").textContent = item.session
+      ? `Aviso ${hour}${storyJourney(item)}. O estudo de ${rec.participant} já está gravando${rec.paused ? " (pausado)" : ""}; o início da história ficou marcado nos eventos da sessão.`
+      : `Aviso ${hour}${storyJourney(item)}. O estudo de ${rec.participant} já está gravando.`;
+  } else {
+    const select = $("story-popup-participant"), lgChoice = $("lg-participant-select").value;
+    const people = [...new Set([...(state.screen_gaze?.participants || []), state.calibration_participant].filter(Boolean))].sort();
+    const preferred = [lgChoice, state.screen_gaze?.participant, state.calibration_participant].find(p => p && people.includes(p)) || people[0] || "";
+    select.innerHTML = people.length ? people.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join("")
+      : '<option value="">Nenhum participante calibrado</option>';
+    select.value = preferred;
+    $("story-popup-text").textContent = `Aviso ${hour}${storyJourney(item)}. Escolha o participante e inicie o estudo: notebook, TV e robô passam a ser gravados como tarefa.`;
+  }
+  $("story-popup").hidden = false;
+  document.title = `● ${item.message} · Observa`;
+  $(rec ? "story-popup-close" : "story-popup-start").focus();
+}
+function closeStoryPopup() { $("story-popup").hidden = true; popupItem = null; document.title = pageTitle; }
+action("story-popup-close", async () => closeStoryPopup());
+document.addEventListener("keydown", event => { if (event.key === "Escape" && popupItem) closeStoryPopup(); });
+action("story-popup-start", async () => {
+  const item = popupItem, participant = $("story-popup-participant").value, error = $("story-popup-error");
+  if (!item) return;
+  error.hidden = true;
+  if (!participant) { error.textContent = "Escolha um participante calibrado. Calibre notebook, TV e robô na página de alvo."; error.hidden = false; return; }
+  $("story-popup-start").disabled = true;
+  try { await post("/recording/start", {participant}); }
+  catch (failure) { error.textContent = failure.message; error.hidden = false; return; }
+  finally { $("story-popup-start").disabled = false; }
+  closeStoryPopup();
+  // Marca na sessão quanto tempo antes do estudo a história começou.
+  const before = item.age + (performance.now() - item.shownAt) / 1000;
+  try { await post("/events", {kind: "HISTORIA_INICIADA", note: `${item.message} (Klara) ${Math.round(before)} s antes do início do estudo${storyJourney(item)}`}); }
+  catch (failure) { notice(`Estudo iniciado, mas o marco da história não foi salvo: ${failure.message}`, true); }
+  document.querySelector('[data-tab="live"]').click();
+  notice(`Estudo de ${participant} iniciado. Notebook, TV e robô contam como tarefa. Pause ou finalize em Olhar ao vivo.`);
+  await poll();
+});
 function liveTarget(data) { return data.stable?.target ?? data.target; }
 function screenBadge(screen, target, display) {
   if (!screen.calibrated) return "Sem calibração";

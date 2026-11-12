@@ -31,6 +31,16 @@
     <main>
       <header><div><span class="eyebrow">MONITORAMENTO MULTICÂMERA</span><h1 id="page-title">Câmeras e sessão</h1></div><span id="server-status" class="badge">Conectando…</span></header>
       <div id="notice" class="notice" role="status" hidden></div>
+      <div id="story-popup" class="popup-backdrop" hidden>
+        <div class="popup" role="alertdialog" aria-modal="true" aria-labelledby="story-popup-title" aria-describedby="story-popup-text">
+          <span class="eyebrow" id="story-popup-source">AVISO DO KLARA</span>
+          <h2 id="story-popup-title">Usuário iniciou a história</h2>
+          <p id="story-popup-text"></p>
+          <label class="small" id="story-popup-pick">Participante calibrado<select id="story-popup-participant"></select></label>
+          <p id="story-popup-error" class="popup-error small" role="alert" hidden></p>
+          <div class="button-row"><button id="story-popup-start">Iniciar estudo</button><button id="story-popup-close" class="secondary">Agora não</button></div>
+        </div>
+      </div>
       <section id="tab-capture" class="tab">
         <div class="panel participant-panel"><label>Identificador do participante<input id="participant" placeholder="Ex.: P001 · informe antes de calibrar" maxlength="80" autocomplete="off"></label><p class="small muted">A calibração pertence a este participante. Refaça o ajuste quando trocar de pessoa ou alterar a disposição do ambiente.</p></div>
         <div class="attention-panel" id="attention-panel"><div><strong id="attention-title">Preparar referência do olhar</strong><p id="attention-message">O sistema precisa aprender onde ficam os alvos nesta disposição.</p></div><button id="start-scene">Calibrar nesta disposição</button></div>
@@ -54,8 +64,8 @@
             <div class="panel-top"><span class="step-number">B</span><div><h2>Gravar o experimento</h2><p>Imagens, classificações e eventos na mesma sessão.</p></div></div>
             <div class="live-result"><span class="eyebrow">ALVO VISUAL ESTIMADO</span><strong id="live-target">Indeterminado</strong><span id="live-task"></span><span id="live-reason">Calibre os alvos para iniciar.</span></div>
             <p id="calibration-owner" class="small muted">Participante ainda não calibrado.</p>
-            <details><summary>Uso em piloto com verificação abaixo de 65%</summary><label>Justificativa registrada na sessão<textarea id="override" placeholder="Descreva por que a sessão será usada apesar do desempenho baixo."></textarea></label></details>
-            <div class="button-row"><button id="start-recording">Iniciar gravação</button><button id="stop-recording" class="danger" disabled>Encerrar</button><span id="recording-time" class="timer">00:00</span></div>
+            <div class="button-row"><button id="start-recording">Iniciar gravação</button><button id="pause-recording" class="secondary" disabled>Pausar</button><button id="stop-recording" class="danger" disabled>Encerrar</button><span id="recording-time" class="timer">00:00</span></div>
+            <p class="small muted">Também dá para escolher o participante calibrado e iniciar, pausar e finalizar o estudo na aba <strong>Olhar ao vivo</strong>.</p>
             <hr><h3>Marcos da apresentação</h3><div class="button-row event-buttons"><button data-event="INICIO_CENA" class="secondary">Cena</button><button data-event="FALA_NAO" class="secondary">Fala do NAO</button><button data-event="DECISAO_NOTEBOOK" class="secondary">Decisão</button><button data-event="SINCRONIA" class="secondary">Sincronia</button></div>
             <label>Nota para o próximo marco<input id="event-note" maxlength="500" placeholder="Ex.: cena 03 / gesto de referência"></label>
             <small>Para validar o alinhamento, faça um gesto visível nas três câmeras e registre um marco no início e no fim. Os tempos de captura são aproximados, sem sincronização de hardware.</small>
@@ -63,7 +73,16 @@
         </div>
       </section>
       <section id="tab-live" class="tab" hidden>
-        <div class="live-banner panel"><div><span class="eyebrow">AGORA A PESSOA ESTÁ OLHANDO PARA</span><strong id="lg-target">Indeterminado</strong><span id="lg-reason" class="small muted">Aguardando leitura.</span></div><div class="live-banner-side"><label class="small">Participante<select id="lg-participant-select"><option value="">Último calibrado</option></select></label><span id="lg-recording" class="badge">Sem gravação</span><span id="lg-participant" class="small muted"></span></div></div>
+        <div id="lg-banner" class="live-banner panel">
+          <div><span class="eyebrow">AGORA A PESSOA ESTÁ OLHANDO PARA</span><strong id="lg-target">Indeterminado</strong><span id="lg-task" class="task-chip">Tarefa: aguardando leitura</span><span id="lg-reason" class="small muted">Aguardando leitura.</span></div>
+          <div class="live-banner-side study-box">
+            <label class="small">Participante calibrado<select id="lg-participant-select"><option value="">Último calibrado</option></select></label>
+            <span id="lg-participant" class="small muted"></span>
+            <span id="lg-surfaces" class="small muted"></span>
+            <div class="button-row study-controls"><button id="lg-start">Iniciar estudo</button><button id="lg-pause" class="secondary" disabled>Pausar</button><button id="lg-stop" class="danger" disabled>Finalizar</button></div>
+            <div class="study-status"><span id="lg-recording" class="badge">Sem gravação</span><span id="lg-timer" class="timer">00:00</span></div>
+          </div>
+        </div>
         <div id="camera-block" class="camera-block">
           <div class="section-heading"><div><h2>As perspectivas do experimento</h2><p>Escolha a origem de cada imagem e aplique a configuração. As três câmeras analisam os olhos.</p></div><button id="save-cameras">Aplicar câmeras</button></div>
           <div class="ray-controls"><label class="ray-toggle"><input id="show-eye-rays" type="checkbox" checked> Mostrar linhas dos olhos</label><label>Verde quando olhar para<select id="ray-reference"><option value="screens">Telas · notebook ou TV</option><option value="robot">Robô NAO</option><option value="task" selected>Tarefa · notebook, TV ou NAO</option></select></label><p class="small muted">Linhas 2D aproximadas. A cor usa a calibração e a fusão das câmeras. Cinza = leitura inconclusiva.</p><p class="small">Posição estimada do olhar: <a href="/alvo?display=notebook" target="_blank" rel="noopener">Abrir alvo no notebook</a> · <a href="/alvo?display=tv" target="_blank" rel="noopener">Abrir alvo na TV</a></p></div>
@@ -93,7 +112,7 @@
         <div class="panel live-legend"><p class="small"><strong>Como ler:</strong> cada câmera calibrada tem a sua cor: <span class="cam-dot" style="background:rgb(99,221,255)"></span> notebook · <span class="cam-dot" style="background:rgb(199,155,255)"></span> NAO · <span class="cam-dot" style="background:rgb(255,207,104)"></span> apresentação. O círculo é a posição estimada e o rastro mostra os últimos 2 segundos. No robô, a parte destacada é a que as câmeras indicam. A borda verde e “Olhando” indicam o alvo reconhecido pela combinação das câmeras. O alvo pode ser reconhecido mesmo quando a posição do ponto é imprecisa ou indisponível.</p><p class="small muted">Os mapas vêm da página de alvo (<a href="/alvo?display=notebook" target="_blank" rel="noopener">notebook</a> · <a href="/alvo?display=tv" target="_blank" rel="noopener">TV</a>), um por câmera, e ficam salvos por participante. É uma estimativa por webcam (normalmente 150 a 450 px de erro numa tela de notebook). Não confirma atenção nem compreensão. Esta aba não precisa da página de alvo aberta durante a apresentação.</p></div>
       </section>
       <section id="tab-dashboard" class="tab" hidden>
-        <div class="section-heading"><div><h2>Resumo do experimento</h2><p>Dados estruturados no SQLite local; imagens e JSONL permanecem como registros brutos.</p></div><div class="button-row"><button id="refresh-dashboard" class="secondary">Atualizar</button><a class="button secondary" href="/api/dashboard/summary.csv">Exportar resumo CSV</a></div></div>
+        <div class="section-heading"><div><h2>Resumo do experimento</h2><p>Dados estruturados no SQLite local; imagens e JSONL permanecem como registros brutos.</p></div><div class="button-row"><button id="refresh-dashboard" class="secondary">Atualizar</button><a class="button secondary" href="/api/dashboard/summary.csv">Exportar resumo CSV</a><a class="button secondary" href="/api/export/predictions.csv" title="Todas as previsões de todas as sessões finalizadas, com participante e sessão em cada linha.">Exportar dados de todos os participantes (CSV)</a></div></div>
         <div id="dashboard-overview" class="metrics dashboard-overview"></div>
         <article class="panel dashboard-filter"><label>Sessão analisada<select id="dashboard-session"><option value="">Nenhuma sessão disponível</option></select></label><p id="dashboard-session-info" class="small muted"></p></article>
         <div id="dashboard-content" hidden>
@@ -114,7 +133,7 @@
       </section>
       <section id="tab-review" class="tab" hidden>
         <div class="section-heading"><div><h2>Revisão independente</h2><p>Anote os intervalos antes de consultar o resultado automático.</p></div><button id="refresh-sessions" class="secondary">Atualizar sessões</button></div>
-        <div class="panel"><label>Sessão gravada<select id="session-list"><option value="">Selecione uma sessão</option></select></label><p id="session-info" class="small muted">As gravações finalizadas aparecem aqui.</p></div>
+        <div class="panel"><label>Sessão gravada<select id="session-list"><option value="">Selecione uma sessão</option></select></label><p id="session-info" class="small muted">As gravações finalizadas aparecem aqui.</p><div class="button-row"><a id="images-download" class="button secondary" href="#" hidden>Baixar imagens desta sessão (3 câmeras)</a><a id="images-download-all" class="button secondary" href="/api/export/images.zip" title="Uma pasta por participante, com as imagens das 3 câmeras. Arquivo grande: cerca de 1,4 GB por sessão.">Baixar imagens de todas as sessões</a></div><p class="small muted">Os ZIPs trazem as pastas Notebook, Apresentacao_TV e NAO e um quadros.csv com o tempo de cada imagem. O de todas as sessões é grande (cerca de 1,4 GB por sessão) e baixa direto, sem preparo.</p></div>
         <div id="review-content" hidden>
           <div class="two-columns review-columns">
             <article class="panel"><div class="section-heading"><h2>Imagens gravadas</h2><label>Perspectiva<select id="review-role"><option value="validation">Apresentação / TV</option><option value="notebook">Notebook</option><option value="nao">NAO</option></select></label></div><div class="review-image"><img id="review-frame" alt="Quadro gravado para anotação" hidden><span id="frame-missing">Selecione um instante.</span></div><div class="button-row"><button id="play" class="secondary">Reproduzir</button><button id="back-frame" class="secondary">−0,2 s</button><button id="next-frame" class="secondary">+0,2 s</button><span id="review-clock" class="timer">0.00 s</span></div><label class="sr-only" for="timeline">Tempo da sessão</label><input id="timeline" type="range" min="0" max="1" step="0.05" value="0"><p id="frame-time" class="small muted"></p><details><summary>Marcos registrados</summary><div id="session-events" class="small"></div></details></article>

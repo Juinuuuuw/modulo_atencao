@@ -452,6 +452,26 @@ class ServerTests(unittest.TestCase):
         wrong_participant = self.client.post("/api/recording/start",json={"participant":"P002"},headers=self.headers)
         self.assertEqual(wrong_participant.status_code,400)
 
+    def test_recording_starts_right_after_calibration_even_with_low_verification(self):
+        """A precisão da verificação fica registrada na sessão, mas não impede iniciar e encerrar."""
+        self.register_and_configure()
+        self.exp.samples = samples()
+        self.exp.calibration_participant = "P001"
+        self.exp.fit_report = self.exp.classifier.fit(self.exp.samples)
+        # Verificação completa (6 avaliações por alvo), mas só 1 acerto em 6 em cada alvo.
+        wrong = {label: TARGETS[(i + 1) % len(TARGETS)] for i, label in enumerate(TARGETS)}
+        self.exp.checks = [{"expected":label,"target":label if k == 0 else wrong[label],"score":1,"step":i}
+                           for i,label in enumerate(TARGETS) for k in range(6)]
+        self.exp.check_report = {**evaluate_checks(self.exp.checks),"sufficient":True}
+        self.assertLess(self.exp.check_report["accuracy"], .65)
+        for i in range(3): self.assertEqual(self.upload(i).status_code,200)
+        response = self.client.post("/api/recording/start",json={"participant":"P001"},headers=self.headers)
+        self.assertEqual(response.status_code,200, response.json)
+        session = json.loads((Path(self.directory.name)/response.json["id"]/"session.json").read_text())
+        self.assertLess(session["check_report"]["accuracy"], .65)
+        self.assertEqual(session["pilot_override"], "")
+        self.assertEqual(self.client.post("/api/recording/stop",headers=self.headers).status_code,200)
+
     def test_download_contains_both_connectors_and_no_access_key(self):
         response = self.client.get("/api/client.zip",headers=self.headers)
         self.assertEqual(response.status_code,200)

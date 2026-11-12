@@ -170,3 +170,14 @@ class AttentionTimeline:
         self.started_at = None
         return [event] if event else []
 
+    def pause(self, timestamp):
+        """Fecha o estado no instante da pausa. O relógio do estudo não conta a pausa,
+        então nada pendente (olhos fechados, olhar fora, atividade) atravessa o corte."""
+        events = self.close(timestamp)
+        self.pending_external = self.pending_sleepy = None
+        self.activity_samples.clear()
+        self.last_activity_sample = None
+        self.gaze_activity = None
+        self.activity_target = None
+        return events
+

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import csv
+from datetime import datetime
 import hashlib
 import io
 import json
@@ -20,10 +21,10 @@ import zipfile
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, request, session, send_file, send_from_directory
+from flask import Flask, Response, jsonify, request, session, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from modules.multicamera import Experiment, read_lines, write_json
+from modules.multicamera import TASK_TARGETS, Experiment, read_lines, write_json
 from modules.target_classifier import ROLES
 from modules.screen_gaze import SURFACES, model_key
 from modules.storage import AnalysisStore
@@ -31,6 +32,124 @@ from modules.validation import (compare_annotators, evaluate_intervals,
                                 evaluate_temporal_events, validate_annotations)
 
 ROOT = Path(__file__).resolve().parent
+
+# Pastas das câmeras nos ZIPs de imagens (nomes do painel, sem acento).
+EXPORT_FOLDERS = {"notebook": "Notebook", "validation": "Apresentacao_TV", "nao": "NAO"}
+PREDICTION_COLUMNS = ["t_seconds", "target", "score", "reason", "attention_state",
+                      "ear", "ear_threshold", "gaze_activity", "notebook", "nao", "validation",
+                      "tracking_valid_json", "screen_gaze_json", "task", "robot_part", "source"]
+
+
+def prediction_csv_row(row):
+    """Uma linha de predictions.jsonl nas colunas de PREDICTION_COLUMNS."""
+    attention = row.get("attention") or {}
+    cameras = row.get("cameras") or {}
+    # Tarefa = notebook, TV ou robô (as três superfícies juntas); fora = outro local.
+    task = ((row.get("regions") or {}).get("task") or {}).get("target") or (
+        "DENTRO" if row["target"] in TASK_TARGETS else "FORA" if row["target"] == "OUTRO_LOCAL" else "INDETERMINADO")
+    return ([row["t"], row["target"], row["score"], row["reason"],
+             attention.get("state"), attention.get("ear"),
+             attention.get("ear_threshold"), attention.get("gaze_activity")] +
+            [cameras.get(role, {}).get("target") for role in ROLES] +
+            [json.dumps({role: bool(cameras.get(role, {}).get("tracking_valid"))
+                         for role in ROLES}, ensure_ascii=False, separators=(",", ":"))] +
+            [json.dumps(row.get("screen_gaze"), ensure_ascii=False, separators=(",", ":"))] +
+            [task, row.get("part") or "", row.get("source") or "classificador"])
+
+
+class ZipSink(io.RawIOBase):
+    """Destino de um ZIP enviado aos poucos (sessões têm GB de imagens).
+
+    O zipfile volta ao cabeçalho de cada arquivo para gravar tamanho e CRC; aqui isso funciona
+    porque só se envia (take) o que já foi concluído, entre um arquivo e outro. Assim o ZIP sai
+    padrão, sem descritores de dados, e abre no Windows, 7-Zip e Python.
+    """
+
+    def __init__(self):
+        self.sent, self.position, self.pending = 0, 0, bytearray()
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self.position, io.SEEK_END: self.sent + len(self.pending)}[whence]
+        if base + offset < self.sent:
+            raise OSError("trecho do ZIP já enviado")
+        self.position = base + offset
+        return self.position
+
+    def write(self, data):
+        start = self.position - self.sent
+        if start == len(self.pending):          # caso comum: acrescenta no fim
+            self.pending += data
+        else:                                   # zipfile regravando o cabeçalho do arquivo atual
+            end = start + len(data)
+            if end > len(self.pending):
+                self.pending.extend(bytes(end - len(self.pending)))
+            self.pending[start:end] = data
+        self.position += len(data)
+        return len(data)
+
+    def take(self):
+        data = bytes(self.pending)
+        self.sent += len(data)
+        self.pending.clear()
+        return data
+
+
+def stream_zip(entries, chunk=1 << 20):
+    """entries: (nome no ZIP, Path ou bytes). JPEG já é comprimido: grava sem compressão."""
+    sink = ZipSink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for name, source in entries:
+            if isinstance(source, (bytes, bytearray)):
+                archive.writestr(name, source)
+            else:   # imagem inteira de uma vez (~100 KB): menos trabalho que copiar em blocos de 8 KB
+                archive.writestr(zipfile.ZipInfo.from_file(source, name), Path(source).read_bytes())
+            if len(sink.pending) >= chunk:
+                yield sink.take()
+    yield sink.take()
+
+
+def safe_name(value, fallback="sessao"):
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "")).strip("_")[:60] or fallback
+
+
+def session_stamp(meta):
+    """Início da sessão no horário local deste computador, ex.: 2026-11-12_10-10-40."""
+    try:
+        return datetime.fromisoformat(str(meta["started_utc"])).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+    except (KeyError, ValueError):
+        return "sem-data"
+
+
+def session_image_entries(path, prefix):
+    """Imagens das 3 câmeras de uma sessão em <prefix>/<câmera>/ e o índice de tempo quadros.csv."""
+    index = io.StringIO(newline="")
+    writer = csv.writer(index)
+    writer.writerow(["camera", "arquivo", "t_seconds", "received_t_seconds", "sequence", "sync_uncertainty_s"])
+    for frame in read_lines(path / "frames.jsonl"):
+        role, file = frame.get("role"), str(frame.get("file", ""))
+        if role in EXPORT_FOLDERS and file:
+            writer.writerow([EXPORT_FOLDERS[role], f"{EXPORT_FOLDERS[role]}/{Path(file).name}", frame.get("t"),
+                             frame.get("received_t"), frame.get("sequence"), frame.get("sync_uncertainty_s")])
+    yield f"{prefix}/quadros.csv", index.getvalue().encode("utf-8-sig")
+    for role, folder in EXPORT_FOLDERS.items():
+        directory = path / role
+        if directory.is_dir():
+            for image in sorted(directory.glob("*.jpg")):
+                yield f"{prefix}/{folder}/{image.name}", image
+
+
+def zip_response(generator, filename):
+    return Response(generator, mimetype="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 def create_app(output=None, access_key=None, start_worker=True, extractor_factory=None):
@@ -392,12 +511,28 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
         sync_analysis(session_id)
         return jsonify(id=session_id)
 
+    @app.post("/api/recording/pause")
+    def pause_recording():
+        paused = bool(body().get("paused", True))
+        with experiment.lock:
+            experiment.pause_recording(paused)
+        return jsonify(ok=True, paused=paused)
+
     @app.post("/api/recording/stop")
     def stop():
         with experiment.lock:
             session_id = experiment.stop_recording()
         sync_analysis(session_id)
         return jsonify(id=session_id)
+
+    @app.post("/api/notifications")
+    def notification():
+        # Aviso de outro sistema (o Klara chama ao começar a história) para o painel mostrar.
+        data = body()
+        with experiment.lock:
+            item = experiment.notify(str(data.get("kind", "")).strip(), str(data.get("message", "")).strip(),
+                                     data.get("details"))
+        return jsonify(ok=True, id=item["id"], session=item["session"])
 
     @app.post("/api/events")
     def event():
@@ -549,21 +684,76 @@ def create_app(output=None, access_key=None, start_worker=True, extractor_factor
         rows = read_lines(session_path(session_id) / "predictions.jsonl")
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer)
-        writer.writerow(["t_seconds", "target", "score", "reason", "attention_state",
-                         "ear", "ear_threshold", "gaze_activity", "notebook", "nao", "validation",
-                         "tracking_valid_json", "screen_gaze_json"])
+        writer.writerow(PREDICTION_COLUMNS)
         for row in rows:
-            attention = row.get("attention") or {}
-            cameras = row.get("cameras") or {}
-            writer.writerow([row["t"], row["target"], row["score"], row["reason"],
-                             attention.get("state"), attention.get("ear"),
-                             attention.get("ear_threshold"), attention.get("gaze_activity")] +
-                            [cameras.get(role, {}).get("target") for role in ROLES] +
-                            [json.dumps({role: bool(cameras.get(role, {}).get("tracking_valid"))
-                                         for role in ROLES}, ensure_ascii=False, separators=(",", ":"))] +
-                            [json.dumps(row.get("screen_gaze"), ensure_ascii=False, separators=(",", ":"))])
+            writer.writerow(prediction_csv_row(row))
         return send_file(io.BytesIO(buffer.getvalue().encode("utf-8-sig")), mimetype="text/csv",
                          as_attachment=True, download_name=f"{session_id}-predictions.csv")
+
+    def finished_sessions():
+        """(pasta, metadados) das sessões já encerradas, por participante e início."""
+        found = []
+        with experiment.lock:
+            for path in experiment.output.glob("*/session.json"):
+                try:
+                    meta = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if meta.get("status") != "recording":
+                    found.append((path.parent, meta))
+        return sorted(found, key=lambda item: (str(item[1].get("participant", "")), str(item[1].get("started_utc", ""))))
+
+    @app.get("/api/export/sessions/<session_id>/images.zip")
+    def export_session_images(session_id):
+        path = session_path(session_id)
+        meta = json.loads((path / "session.json").read_text(encoding="utf-8"))
+        if meta.get("status") == "recording":
+            raise ValueError("Finalize a gravação antes de baixar as imagens")
+        name = f"{safe_name(meta.get('participant'))}_{session_stamp(meta)}"
+        return zip_response(stream_zip(session_image_entries(path, name)), f"{name}_imagens.zip")
+
+    @app.get("/api/export/images.zip")
+    def export_all_images():
+        sessions = finished_sessions()
+        if not sessions:
+            raise ValueError("Nenhuma sessão finalizada para baixar")
+        count = {}
+        for _, meta in sessions:
+            participant = safe_name(meta.get("participant"), "sem_participante")
+            count[participant] = count.get(participant, 0) + 1
+
+        def entries():
+            for path, meta in sessions:
+                participant = safe_name(meta.get("participant"), "sem_participante")
+                # Participante com uma sessão: P002/Notebook...; com várias: P009/<início>_<id>/Notebook...
+                prefix = participant if count[participant] == 1 else \
+                    f"{participant}/{session_stamp(meta)}_{str(meta.get('id', path.name))[:8]}"
+                yield from session_image_entries(path, prefix)
+
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        return zip_response(stream_zip(entries()), f"observa_imagens_todas_{stamp}.zip")
+
+    @app.get("/api/export/predictions.csv")
+    def export_all_predictions():
+        """Previsões de todas as sessões encerradas num CSV só (uma linha por previsão, ~5 Hz)."""
+        sessions = finished_sessions()
+
+        def lines():
+            buffer = io.StringIO(newline="")
+            writer = csv.writer(buffer)
+            writer.writerow(["participant", "session_id", "started_utc", "session_status"] + PREDICTION_COLUMNS)
+            yield "﻿" + buffer.getvalue()
+            for path, meta in sessions:
+                buffer.seek(0)
+                buffer.truncate()
+                for row in read_lines(path / "predictions.jsonl"):
+                    writer.writerow([meta.get("participant"), meta.get("id", path.name), meta.get("started_utc"),
+                                     meta.get("status")] + prediction_csv_row(row))
+                yield buffer.getvalue()
+
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        return Response((text.encode("utf-8") for text in lines()), mimetype="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="observa_dados_todos_participantes_{stamp}.csv"'})
 
     @app.get("/api/client.zip")
     def client_zip():

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import re
 import threading
 import time
 import uuid
@@ -18,8 +19,26 @@ from .attention_timeline import AttentionConfig, AttentionTimeline
 from .target_classifier import TARGETS, UNKNOWN, ROLES, REGIONS, TargetClassifier, feature_status, screen_feature_status, fuse, region_votes
 from .validation import evaluate_checks
 from .calibration_protocol import PROFILES, calibration_plan
-from .screen_gaze import ScreenGaze, SURFACES, fuse_surfaces, screen_vector
+from .screen_gaze import ScreenGaze, SURFACES, fuse_surfaces, screen_vector, zone_log_probabilities
 from .temporal_filter import FeatureSmoother, StableTarget
+
+SURFACE_TARGETS = {"notebook": "NOTEBOOK", "tv": "TV", "robot": "NAO"}
+SURFACE_LABELS = {"notebook": "o notebook", "tv": "a TV", "robot": "o robô NAO"}
+# No estudo, o alvo da tarefa são as três superfícies juntas: olhar qualquer uma é estar na tarefa.
+TASK_TARGETS = ("NOTEBOOK", "TV", "NAO")
+
+
+# Aviso de outro sistema: tipo curto (ex.: historia_iniciada) e por quanto tempo o painel o mostra.
+NOTIFICATION_KIND = re.compile(r"[a-z0-9_]{1,60}")
+NOTIFICATION_TTL = 600
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def finite_or_none(value):
+    return round(float(value), 4) if value is not None and math.isfinite(float(value)) else None
 
 
 def write_json(path, value):
@@ -80,6 +99,11 @@ class Experiment:
         self.live = {"target": UNKNOWN, "score": 0, "reason": "calibre os alvos"}
         self.errors = {}
         self.last_error = None
+        # Última amostra do estudo que não pôde ser registrada; some quando a seguinte grava.
+        self.sample_error = None
+        # Avisos de outros sistemas para quem conduz o estudo (o Klara avisa que a história começou).
+        self.notifications = deque(maxlen=20)
+        self.notification_id = 0
         self.stop_event = threading.Event()
         self.extractor_factory = extractor_factory
         self.thread = None
@@ -185,7 +209,9 @@ class Experiment:
             frame = Frame(image, jpeg, capture, now, uncertainty, sequence, pose, device_timestamp)
             self.frames[source] = frame
             self.frame_times.setdefault(source, deque(maxlen=120)).append(now)
-            if self.current:
+            current = self.current
+            # Em pausa nada é salvo; ao retomar, só quadros capturados depois da retomada.
+            if current and current["paused_at"] is None and capture >= current["resumed_at"]:
                 role = next(r for r, s in self.assignments.items() if s == source)
                 t = capture - self.current["origin"]
                 if t >= 0:
@@ -474,7 +500,7 @@ class Experiment:
                     with self.lock:
                         self.last_error = f"Falha ao gravar no disco: {error}. A sessão foi interrompida."
                         if self.current:
-                            self.current["metadata"].update(status="interrupted", duration=time.perf_counter() - self.current["origin"])
+                            self.current["metadata"].update(status="interrupted", duration=self.study_time())
                             try:
                                 write_json(self.current["path"] / "session.json", self.current["metadata"])
                             except OSError:
@@ -540,32 +566,96 @@ class Experiment:
             self.checks.append({"step": cal["index"], "expected": cal["plan"][cal["index"]]["target"],
                                 "elapsed": now - cal["started"], **self.live})
         self._advance_calibration(now)
-        # O registro mantém ~5 Hz mesmo quando a análise roda mais rápido.
-        if self.current and now - self.last_logged >= 0.19:
+        # O registro mantém ~5 Hz mesmo quando a análise roda mais rápido. Em pausa, nada.
+        if self.current and self.current["paused_at"] is None and now - self.last_logged >= 0.19:
             self.last_logged = now
-            screens = {}
-            labels = self.camera_labels()
-            for key in self.screen_gaze.models:
-                position = self.screen_gaze.position(key, now, self.observations, labels, self.displays, require_view=False)
-                screens[key] = ([position["x"], position["y"]] + ([position["part"]] if "part" in position else [])
-                                if position["visible"] else None)
-            t = now - self.current["origin"]
-            tracking = {role: bool(value.get("tracking_valid")) for role, value in predictions.items()}
-            ears = [value["ear"] for value in predictions.values()
-                    if value.get("tracking_valid") and value.get("ear") is not None]
-            ear = float(np.median(ears)) if ears else None
-            supporting = [role for role, value in predictions.items()
-                          if value.get("tracking_valid") and value.get("target") == self.live["target"]]
-            gaze_point = self._attention_gaze_point(self.live["target"], screens)
-            closed, attention = self.attention_tracker.update(
-                t, self.live["target"], ear=ear, tracking=tracking,
-                supporting_cameras=supporting, gaze_point=gaze_point)
-            self.attention_live = attention
-            for event in closed:
-                append_json(self.current["path"] / "attention_events.jsonl", event)
-            append_json(self.current["path"] / "predictions.jsonl", {
-                "t": t, **self.live, "cameras": predictions, "screen_gaze": screens,
-                "attention": attention})
+            try:
+                self._log_sample(now, predictions)
+                self.sample_error = None
+            except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+                # Uma leitura inesperada perde só esta amostra (contada na sessão): o
+                # processamento das câmeras e a aba ao vivo não podem parar no meio do estudo.
+                self.current["metadata"]["dropped_samples"] = self.current["metadata"].get("dropped_samples", 0) + 1
+                self.sample_error = f"Uma amostra do estudo não foi registrada ({type(error).__name__}: {error})"
+
+    def _log_sample(self, now, predictions):
+        if self.current["method"] == "posição":
+            row = self._position_row(now)
+        else:
+            row = self._classifier_row(now, predictions)
+        cameras, screens = row["cameras"], row["screen_gaze"]
+        t = now - self.current["origin"]
+        tracking = {role: bool(value.get("tracking_valid")) for role, value in cameras.items()}
+        ears = [value["ear"] for value in cameras.values()
+                if value.get("tracking_valid") and value.get("ear") is not None]
+        ear = float(np.median(ears)) if ears else None
+        supporting = [role for role, value in cameras.items()
+                      if value.get("tracking_valid") and value.get("target") == row["target"]]
+        gaze_point = self._attention_gaze_point(row["target"], screens)
+        closed, attention = self.attention_tracker.update(
+            t, row["target"], ear=ear, tracking=tracking,
+            supporting_cameras=supporting, gaze_point=gaze_point)
+        # Serializa antes de escrever: uma falha não deixa linha pela metade no arquivo.
+        line = json.dumps({"t": t, **row, "attention": attention}, ensure_ascii=False, allow_nan=False)
+        self.attention_live = attention
+        for event in closed:
+            append_json(self.current["path"] / "attention_events.jsonl", event)
+        with (self.current["path"] / "predictions.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+    def _screen_positions(self, now, participant):
+        screens = {}
+        labels = self.camera_labels()
+        for key in self.screen_gaze.models_for(participant):
+            position = self.screen_gaze.position(key, now, self.observations, labels, self.displays,
+                                                 require_view=False, participant=participant)
+            screens[key] = ([position["x"], position["y"]] + ([position["part"]] if "part" in position else [])
+                            if position["visible"] else None)
+        return screens
+
+    def _classifier_row(self, now, predictions):
+        return {**self.live, "source": "classificador", "cameras": predictions,
+                "screen_gaze": self._screen_positions(now, self.current["participant"])}
+
+    def _position_row(self, now):
+        """Uma amostra do estudo pela calibração de posição do participante.
+
+        O alvo registrado é o mesmo que a aba "Olhar ao vivo" mostra (com histerese). As
+        três superfícies contam como tarefa; `task` resume dentro/fora.
+        """
+        decision = self.live_gaze(now, participant=self.current["participant"], viewer=False)
+        stable = decision["stable"]
+        target = stable["target"]
+        screens = {}
+        for surface in SURFACES:
+            item = decision["robot"] if surface == "robot" else decision["screens"][surface]
+            for estimate in item["estimates"]:
+                gaze = estimate["gaze"]
+                screens[f"{surface}:{estimate['role']}"] = (
+                    [gaze["x"], gaze["y"]] + ([gaze["part"]] if "part" in gaze else []) if gaze.get("visible") else None)
+        cameras = {}
+        for role in ROLES:
+            if not self.assignments.get(role) and role not in self.observations:
+                continue
+            observation = self.observations.get(role) or {}
+            reading = self.reading_status(role, now, spatial=True)
+            ratios = {s: finite_or_none(r) for s, r in (decision["evidence"].get(role) or {}).items()}
+            known = {s: r for s, r in ratios.items() if r is not None}
+            if reading["valid"] and known:
+                # O que esta câmera sozinha diria: a zona mais provável, ou fora de todas.
+                logp = zone_log_probabilities(known)
+                top = max(logp, key=logp.get)
+                camera = {"target": SURFACE_TARGETS.get(top, "OUTRO_LOCAL"),
+                          "score": round(math.exp(logp[top]), 3), "reason": "zonas da calibração de posição"}
+            else:
+                camera = {"target": UNKNOWN, "score": 0, "reason": reading["reason"]}
+            cameras[role] = {**camera, "tracking_valid": bool(reading["valid"]), "zone_ratios": ratios,
+                             "ear": finite_or_none(observation.get("ear")), "face_count": observation.get("face_count", 0),
+                             "sync_uncertainty_s": observation.get("uncertainty")}
+        return {"target": target, "raw_target": decision["target"], "part": stable["part"],
+                "score": decision["score"], "reason": decision["reason"], "source": "posição",
+                "regions": region_votes({"target": target, "score": decision["score"], "reason": decision["reason"]}),
+                "cameras": cameras, "screen_gaze": screens}
 
     @staticmethod
     def _attention_gaze_point(target, screens):
@@ -576,7 +666,13 @@ class Experiment:
                   if key.startswith(surface + ":") and value is not None]
         return np.median(np.asarray(points, dtype=float), axis=0).tolist() if points else None
 
-    def live_gaze(self, now=None, participant=None):
+    def default_participant(self):
+        """Durante um estudo, as vistas sem participante escolhido seguem quem está sendo gravado."""
+        if self.current:
+            return self.current["participant"]
+        return self.screen_gaze.participant or self.calibration_participant
+
+    def live_gaze(self, now=None, participant=None, viewer=True):
         """Para onde a pessoa olha, pelas calibrações de posição do participante escolhido.
 
         Cada câmera compara a leitura com as zonas das superfícies que conhece (as dos
@@ -585,18 +681,21 @@ class Experiment:
         alvos, se houver.
         """
         now = time.perf_counter() if now is None else now
-        self.live_viewer_seen = now
+        if viewer:
+            self.live_viewer_seen = now
         gaze = self.screen_gaze
-        participant = participant or gaze.participant or self.calibration_participant
+        participant = participant or self.default_participant()
         labels = self.camera_labels()
-        surfaces = {surface: {"calibrated": False, "estimates": []} for surface in SURFACES}
+        # usable: há mapa desta superfície feito com uma câmera ligada agora no mesmo papel.
+        surfaces = {surface: {"calibrated": False, "usable": False, "estimates": []} for surface in SURFACES}
         # evidence[câmera][superfície] = razão da leitura à zona daquela superfície (≤ 1 = dentro).
         evidence, parts = {}, {}
-        for key in sorted(gaze.models_for(participant)):
+        for key, model in sorted(gaze.models_for(participant).items()):
             surface, role = key.split(":")
             position = gaze.position(key, now, self.observations, labels, self.displays,
                                      require_view=False, participant=participant)
             surfaces[surface]["calibrated"] = True
+            surfaces[surface]["usable"] |= labels.get(role) == model["source"]
             surfaces[surface]["estimates"].append({**gaze.summary(key, participant), "gaze": position})
             if position.get("zone_ratios") or position["visible"] or position.get("outside"):
                 ratios = dict(position.get("zone_ratios") or {})
@@ -606,7 +705,7 @@ class Experiment:
                 evidence.setdefault(role, {}).update(ratios)
                 if position.get("inside") and surface == "robot":
                     parts[role] = position["part"]
-        names = {"notebook": "NOTEBOOK", "tv": "TV", "robot": "NAO"}
+        names = SURFACE_TARGETS
         if any(item["calibrated"] for item in surfaces.values()):
             # Cada câmera pesa pela certeza dela: uma câmera que não separa duas superfícies
             # (a da TV, com o robô na frente da TV) pesa pouco; a que separa decide.
@@ -645,7 +744,10 @@ class Experiment:
                 "participant": participant, "participants": gaze.participants(),
                 "classifier_ready": bool(self.classifier.models),
                 "screens": {d: surfaces[d] for d in ("notebook", "tv")}, "robot": surfaces["robot"],
+                "evidence": evidence,
                 "recording": bool(self.current),
+                "recording_participant": self.current["participant"] if self.current else None,
+                "paused": bool(self.current and self.current["paused_at"] is not None),
                 "cameras": {role: bool(self.frames.get(source) and now - self.frames[source].capture < 0.7)
                             for role, source in self.assignments.items() if source}}
 
@@ -656,7 +758,7 @@ class Experiment:
         fresh = bool(observation and time.perf_counter() - observation["capture"] <= 0.35
                      and abs(frame.capture - observation["capture"]) <= 0.30)
         geometry = observation if fresh else {}
-        participant = participant or self.screen_gaze.participant or self.calibration_participant
+        participant = participant or self.default_participant()
         models = self.screen_gaze.models_for(participant)
         spatial = bool(models)
         decision = self.live_gaze(participant=participant) if spatial else self.live
@@ -698,34 +800,67 @@ class Experiment:
             raise ValueError("Já existe uma sessão em gravação")
         if not participant or len(participant) > 80:
             raise ValueError("Informe um identificador de participante com até 80 caracteres")
-        if participant != self.calibration_participant:
-            raise ValueError("Calibre os alvos para este participante antes de gravar")
-        if not self.classifier.models or not self.check_report or not self.check_report["sufficient"]:
-            raise ValueError("Conclua a calibração e a verificação de todos os alvos")
         if self.calibration and self.calibration["started"] is not None:
             raise ValueError("Aguarde a etapa atual terminar")
-        for role, source in self.assignments.items():
+        # O estudo usa a calibração de posição salva do participante (a mesma da aba "Olhar ao
+        # vivo"), com notebook, TV e robô juntos. Sem ela, usa o classificador de alvos, se foi
+        # calibrado e verificado para esta pessoa. A acurácia da verificação fica registrada,
+        # mas não impede a gravação: nos pilotos nunca passava de 65%.
+        position_models = self.screen_gaze.models_for(participant)
+        own_classifier = participant == self.calibration_participant
+        if position_models:
+            calibrated = {model["surface"] for model in position_models.values()}
+            missing = [SURFACE_LABELS[surface] for surface in SURFACES if surface not in calibrated]
+            if missing:
+                raise ValueError(f"O estudo usa notebook, TV e robô juntos: calibre também "
+                                 f"{' e '.join(missing)} para {participant}")
+            # Um mapa só vale com a mesma câmera física (computador/índice) no mesmo papel.
+            labels = self.camera_labels()
+            usable = {model["surface"] for model in position_models.values()
+                      if labels.get(model["role"]) == model["source"]}
+            stale = [SURFACE_LABELS[surface] for surface in SURFACES if surface not in usable]
+            if stale:
+                raise ValueError(f"A calibração de {participant} para {' e '.join(stale)} foi feita com outras "
+                                 f"câmeras. Recalibre com as câmeras atuais na página de alvo")
+            method = "posição"
+        elif own_classifier and self.classifier.models and self.check_report and self.check_report["sufficient"]:
+            method = "classificador"
+        elif own_classifier and self.classifier.models:
+            raise ValueError("Conclua a verificação de todos os alvos (pelo menos 5 avaliações por alvo)")
+        else:
+            raise ValueError(f"{participant} ainda não tem calibração. Calibre antes de iniciar o estudo")
+        assigned = {role: source for role, source in self.assignments.items() if source}
+        if not assigned:
+            raise ValueError("Selecione as câmeras antes de gravar")
+        # Uma câmera sem papel (ex.: a da TV desligada) não impede o estudo.
+        for role, source in assigned.items():
             frame = self.frames.get(source)
             if not frame or time.perf_counter() - frame.capture > 0.7:
                 raise ValueError(f"Câmera {role} sem sinal recente")
-        report = self.check_report
-        if (report["accuracy"] < 0.65 or report["coverage"] < 0.65) and not override.strip():
-            raise ValueError("Verificação abaixo de 65%. Recalibre ou registre uma justificativa de uso em piloto.")
         session_id = uuid.uuid4().hex
         path = self.output / session_id
         path.mkdir()
         for role in ROLES:
             (path / role).mkdir()
         metadata = {"id": session_id, "participant": participant,
-                    "started_utc": datetime.now(timezone.utc).isoformat(), "duration": None,
-                    "status": "recording", "assignments": dict(self.assignments),
+                    "started_utc": utc_now(), "duration": None,
+                    "status": "recording", "decision_source": method,
+                    "task_targets": list(TASK_TARGETS),
+                    # Tempos da sessão (t) não contam as pausas; cada pausa fica registrada aqui.
+                    "pauses": [], "paused_duration": 0.0,
+                    "assignments": dict(self.assignments),
                     "calibration_participant": self.calibration_participant,
-                    "calibration_protocol": self.calibration_protocol,
-                    "screen_gaze_models": self.screen_gaze.export(),
+                    "calibration_protocol": self.calibration_protocol if own_classifier else None,
+                    "screen_gaze_participant": participant if position_models else None,
+                    "screen_gaze_models": self.screen_gaze.export(participant) if position_models else {},
                     "nodes": {k: {"name": v["name"], "cameras": v["cameras"]} for k, v in self.nodes.items()},
-                    "calibration": self.samples, "models": self.classifier.models,
-                    "pose_reference": self.pose_reference, "fit_report": self.fit_report,
-                    "check_samples": self.checks, "check_report": self.check_report,
+                    # O classificador só entra quando foi calibrado para esta mesma pessoa.
+                    "calibration": self.samples if own_classifier else [],
+                    "models": self.classifier.models if own_classifier else {},
+                    "pose_reference": self.pose_reference if own_classifier else {},
+                    "fit_report": self.fit_report if own_classifier else None,
+                    "check_samples": self.checks if own_classifier else [],
+                    "check_report": self.check_report if own_classifier else None,
                     "attention_method": {
                         "config": self.attention_config.export(),
                         "low_activity_label": "indicador observável; não infere distração cognitiva",
@@ -734,9 +869,15 @@ class Experiment:
                     "timing": "captura aproximada após leitura, corrigida por RTT; não é sincronização de hardware"}
         write_json(path / "session.json", metadata)
         write_json(path / "annotations.json", {})
-        self.current = {"id": session_id, "path": path, "origin": time.perf_counter(), "metadata": metadata}
-        ears = [float(row["ear"]) for row in self.samples
+        self.current = {"id": session_id, "path": path, "origin": time.perf_counter(), "metadata": metadata,
+                        "participant": participant, "method": method,
+                        "paused_at": None, "resumed_at": -math.inf}
+        ears = [float(row["ear"]) for row in (self.samples if own_classifier else [])
                 if row.get("ear") is not None and math.isfinite(float(row["ear"]))]
+        if not ears:
+            # Abertura dos olhos de referência pela calibração de posição (centro das zonas).
+            ears = [float(model["zone"]["center"][4]) for model in position_models.values()
+                    if model.get("zone") and math.isfinite(float(model["zone"]["center"][4]))]
         reference = float(np.median(ears)) if ears else None
         self.attention_tracker = AttentionTimeline(self.attention_config, reference, ROLES)
         metadata["attention_method"].update(ear_reference=reference,
@@ -755,13 +896,79 @@ class Experiment:
         if not kind or len(kind) > 80 or len(note) > 500:
             raise ValueError("Evento inválido")
         append_json(self.current["path"] / "events.jsonl", {
-            "t": time.perf_counter() - self.current["origin"], "kind": kind, "note": note})
+            "t": self.study_time(), "kind": kind, "note": note})
+
+    def notify(self, kind, message, details=None):
+        """Aviso de outro sistema para o painel, como "Usuário iniciou a história" do Klara.
+        O painel mostra o aviso para a pessoa iniciar o estudo; com estudo gravando, vira um marco."""
+        if not NOTIFICATION_KIND.fullmatch(kind or ""):
+            raise ValueError("Tipo de aviso inválido")
+        if not message or len(message) > 200:
+            raise ValueError("Informe a mensagem do aviso com até 200 caracteres")
+        details = {} if details is None else details
+        if not isinstance(details, dict) or len(details) > 10:
+            raise ValueError("Detalhes do aviso inválidos")
+        clean = {}
+        for key, value in details.items():
+            if not isinstance(key, str) or not 0 < len(key) <= 40 or isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError("Detalhes do aviso inválidos")
+            clean[key] = str(value)[:200]
+        self.notification_id += 1
+        item = {"id": self.notification_id, "kind": kind, "message": message, "details": clean,
+                "utc": utc_now(), "at": time.perf_counter(), "session": None}
+        if self.current:
+            self.event(kind.upper(), " · ".join([message, *(f"{key}: {value}" for key, value in clean.items())])[:500])
+            item["session"] = self.current["id"]
+        self.notifications.append(item)
+        return item
+
+    def study_time(self, now=None):
+        """Segundos de estudo da sessão atual, sem contar as pausas."""
+        current = self.current
+        now = time.perf_counter() if now is None else now
+        return (current["paused_at"] if current["paused_at"] is not None else now) - current["origin"]
+
+    def pause_recording(self, paused):
+        """Pausa ou retoma o estudo. Na pausa nada é gravado e o relógio do estudo para:
+        ao retomar, os tempos seguem de onde pararam (marcos PAUSA/RETOMADA nos eventos)."""
+        if not self.current:
+            raise ValueError("Nenhuma gravação ativa")
+        current, now = self.current, time.perf_counter()
+        metadata = current["metadata"]
+        if paused == (current["paused_at"] is not None):
+            return
+        if paused:
+            t = now - current["origin"]
+            current["paused_at"] = now
+            if self.attention_tracker:
+                for event in self.attention_tracker.pause(t):
+                    append_json(current["path"] / "attention_events.jsonl", event)
+            metadata["pauses"].append({"t": t, "started_utc": utc_now(), "ended_utc": None, "duration": None})
+            append_json(current["path"] / "events.jsonl", {"t": t, "kind": "PAUSA", "note": "estudo pausado"})
+        else:
+            self._close_pause(now)
+            current["origin"] += now - current["paused_at"]
+            current["paused_at"], current["resumed_at"] = None, now
+            append_json(current["path"] / "events.jsonl", {
+                "t": now - current["origin"], "kind": "RETOMADA",
+                "note": f"pausa de {metadata['pauses'][-1]['duration']:.1f} s"})
+            self.last_logged = -1e9
+        write_json(current["path"] / "session.json", metadata)
+
+    def _close_pause(self, now):
+        current = self.current
+        gap = now - current["paused_at"]
+        current["metadata"]["pauses"][-1].update(ended_utc=utc_now(), duration=gap)
+        current["metadata"]["paused_duration"] += gap
 
     def stop_recording(self):
         if not self.current:
             raise ValueError("Nenhuma gravação ativa")
         current = self.current
-        duration = time.perf_counter() - current["origin"]
+        now = time.perf_counter()
+        duration = self.study_time(now)
+        if current["paused_at"] is not None:
+            self._close_pause(now)
         if self.attention_tracker:
             for event in self.attention_tracker.close(duration):
                 append_json(current["path"] / "attention_events.jsonl", event)
@@ -769,6 +976,7 @@ class Experiment:
         write_json(current["path"] / "session.json", current["metadata"])
         self.current = None
         self.attention_tracker = None
+        self.sample_error = None
         return current["id"]
 
     def reading_status(self, role, now=None, spatial=False):
@@ -810,11 +1018,17 @@ class Experiment:
                                    "reading": self.reading_status(role, now)}
                             for role, source in self.assignments.items()},
                 "live": self.live, "attention": self.attention_live,
-                "error": self.last_error, "calibration": calibration,
+                "error": self.last_error or self.sample_error, "calibration": calibration,
                 "displays": self.display_status(now),
                 "screen_gaze": {"calibration": self.screen_gaze.cue(now),
                                 "participant": self.screen_gaze.participant,
-                                "available": list(self.screen_gaze.models)},
+                                "available": list(self.screen_gaze.models),
+                                "participants": self.screen_gaze.participants()},
+                "notifications": [{**{key: value for key, value in item.items() if key != "at"}, "age": now - item["at"]}
+                                  for item in self.notifications if now - item["at"] < NOTIFICATION_TTL],
                 "calibration_participant": self.calibration_participant, "fit_report": self.fit_report,
                 "check_report": self.check_report,
-                "recording": {"id": self.current["id"], "elapsed": now - self.current["origin"]} if self.current else None}
+                "recording": {"id": self.current["id"], "elapsed": self.study_time(now),
+                              "paused": self.current["paused_at"] is not None,
+                              "participant": self.current["participant"],
+                              "source": self.current["method"]} if self.current else None}

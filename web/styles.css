@@ -11,6 +11,13 @@
 .live-banner strong{display:block;font-size:30px;letter-spacing:-.8px;color:var(--teal);line-height:1.2;margin:4px 0}
 .live-banner strong.unknown{color:var(--muted)}
 .live-banner-side{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.live-banner{border-left:4px solid var(--line)}.live-banner.on-task{border-left-color:#42b883}.live-banner.off-task{border-left-color:#d77a6f}
+.task-chip{display:table;font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;background:#e8eeeb;color:#657d78;margin:2px 0 6px}
+.task-chip.in{background:#dcefe5;color:#176f59}.task-chip.out{background:#f9e3df;color:#a53c34}
+.study-box{min-width:290px;text-align:right}.study-box label{margin:0;width:100%}.study-controls{justify-content:flex-end}
+.study-status{display:flex;align-items:center;gap:12px}.study-status .timer{margin-left:0}
+.badge.paused{background:#fbecd9;color:#9a5a1d}
+@media(max-width:750px){.study-box{min-width:0;width:100%;text-align:left}.study-controls{justify-content:flex-start}}
 .gaze-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr) minmax(0,.8fr);gap:18px;margin-bottom:20px;align-items:start}
 .gaze-card{margin-bottom:0;transition:border-color .15s,box-shadow .15s}
 .gaze-card.looking{border-color:#2fc486;box-shadow:0 0 0 3px #2fc48633}
@@ -35,3 +42,5 @@
 
 /* Dados e análises */
 .dashboard-overview{margin-top:0}.dashboard-filter{display:flex;align-items:end;gap:24px;padding-top:14px;padding-bottom:14px}.dashboard-filter label{min-width:320px;margin:0}.dashboard-filter p{margin:0 0 10px}.dashboard-columns{grid-template-columns:1fr 1fr}.distribution-row,.camera-quality-row{margin:18px 0}.distribution-row>div:first-child,.camera-quality-row>div:first-child{display:flex;align-items:center;gap:8px;margin-bottom:6px}.distribution-row span:last-child,.camera-quality-row span{margin-left:auto;color:var(--muted);font-size:11px}.chart-dot{width:9px;height:9px;border-radius:50%;flex:none}.chart-dot.target-NOTEBOOK{background:#168c82}.chart-dot.target-TV{background:#4c8dc7}.chart-dot.target-NAO{background:#9167bd}.chart-dot.target-OUTRO_LOCAL{background:#d68a3c}.chart-dot.target-INDETERMINADO{background:#9ba6a5}.analysis-progress{display:block;width:100%;height:9px;margin:0;accent-color:var(--teal)}.analysis-progress.target-NOTEBOOK{accent-color:#168c82}.analysis-progress.target-TV{accent-color:#4c8dc7}.analysis-progress.target-NAO{accent-color:#9167bd}.analysis-progress.target-OUTRO_LOCAL{accent-color:#d68a3c}.analysis-progress.target-INDETERMINADO{accent-color:#9ba6a5}.method-note{display:grid;gap:7px;padding:14px;border:1px solid var(--line);border-radius:9px;background:var(--surface-soft)}.method-note span{color:var(--muted);line-height:1.5}.dashboard-events{max-height:260px;overflow:auto}.dashboard-events p{padding-bottom:10px;border-bottom:1px solid var(--line);margin-bottom:10px}.report-summary{display:grid;gap:4px;padding:12px 0;border-bottom:1px solid var(--line)}.report-summary span{color:var(--muted)}.dash-open{padding:5px 9px;font-size:11px}@media(max-width:750px){.dashboard-filter{display:block}.dashboard-filter label{min-width:0}.dashboard-columns{grid-template-columns:1fr}}
+/* Aviso de outro sistema (Klara: história iniciada) para iniciar o estudo */
+.popup-backdrop{position:fixed;inset:0;z-index:50;background:rgba(17,46,51,.55);display:grid;place-items:center;padding:16px}.popup{background:#fff;border-radius:12px;border-top:5px solid var(--teal);padding:26px 28px;width:min(460px,100%);box-shadow:0 18px 50px rgba(9,30,34,.35)}.popup h2{font-size:24px;margin:6px 0 8px}.popup p{font-size:13px}.popup label{margin:10px 0 14px}.popup .button-row{justify-content:flex-end}.popup-error{color:var(--red);background:#fff2ef;border-left:3px solid var(--red);padding:9px 11px;border-radius:4px}@media(max-width:750px){.popup{padding:20px 18px}.popup .button-row button{flex:1}}
